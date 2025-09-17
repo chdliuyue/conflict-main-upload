@@ -233,15 +233,17 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
     DRAC_base = pd.Series(np.nan, index=out.index, dtype=float)
     DRAC_base.loc[clos_mask_base] = (dv_base[clos_mask_base] ** 2) / (2.0 * D_drac_base[clos_mask_base] + EPS)
 
+    lead_v_abs = pd.to_numeric(out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce").abs()
     PSD_base = pd.Series(np.nan, index=out.index, dtype=float)
-    denom = (vf_abs ** 2) / (2.0 * mu * grav + EPS)
-    PSD_base.loc[clos_mask_base & (vf_abs > 0.0)] = D_eff_base_adj[clos_mask_base & (vf_abs > 0.0)] / (denom[clos_mask_base & (vf_abs > 0.0)] + EPS)
+    psd_denom = (vf_abs ** 2 - lead_v_abs ** 2) / (2.0 * mu * grav + EPS)
+    psd_valid = clos_mask_base & (vf_abs > 0.0) & (psd_denom > 0.0)
+    PSD_base.loc[psd_valid] = D_eff_base_adj[psd_valid] / (psd_denom[psd_valid] + EPS)
 
     out["TTC"] = TTC_base
     out["DRAC"] = DRAC_base
     out["DRAC_valid_mask"] = clos_mask_base.astype(int)
     out["PSD_base"] = PSD_base
-    out["PSD_valid_mask"] = clos_mask_base.astype(int)
+    out["PSD_valid_mask"] = psd_valid.astype(int)
 
     # L/R 候选
     for tag, cand in [("L", "leftPrecedingId"), ("R", "rightPrecedingId")]:
