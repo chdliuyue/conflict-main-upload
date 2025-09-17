@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
-    "percentile", "resolve_col",
+    "percentile", "weighted_percentile", "resolve_col",
     "compute_frame_ssm_base", "compute_frame_ssm_union",
     "compute_window_base_quantiles", "compute_nodewise_labels",
     "ttc_weight_from_value", "drac_weight_from_value", "psd_weight_from_value",
@@ -51,6 +51,44 @@ NODE_BUCKET_HZ_TARGET = 1.0
 def percentile(s: pd.Series, q_percent: float) -> float:
     s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     return float(np.percentile(s, q_percent)) if len(s) else np.nan
+
+
+def weighted_percentile(values: pd.Series, weights: pd.Series, q: float) -> float:
+    """Return the weighted quantile of *values* (``0<=q<=1``)."""
+
+    if values is None or weights is None:
+        return np.nan
+
+    v = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce")
+    mask = v.notna() & w.notna() & (w > 0)
+    if not mask.any():
+        return np.nan
+
+    v = v.loc[mask].astype(float)
+    w = w.loc[mask].astype(float)
+    if v.empty or w.empty:
+        return np.nan
+
+    order = np.argsort(v.values)
+    v = v.iloc[order]
+    w = w.iloc[order]
+
+    total = float(w.sum())
+    if total <= 0:
+        return np.nan
+
+    q = float(np.clip(q, 0.0, 1.0))
+    if q <= 0.0:
+        return float(v.iloc[0])
+    if q >= 1.0:
+        return float(v.iloc[-1])
+
+    cumulative = w.cumsum().values
+    cutoff = q * total
+    idx = int(np.searchsorted(cumulative, cutoff, side="left"))
+    idx = min(max(idx, 0), len(v) - 1)
+    return float(v.iloc[idx])
 
 def resolve_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     m = {c.lower(): c for c in df.columns}
@@ -373,92 +411,130 @@ def compute_nodewise_labels(
     node_idx = np.floor((sub["time"].values - float(t0)) * float(node_hz)).astype("int64")
     bucket_factor = max(1, int(round(float(node_hz) / float(NODE_BUCKET_HZ_TARGET))))
     bucket_idx = (node_idx // bucket_factor).astype("int64")
-    bucket_dt = float(bucket_factor) / float(node_hz)  # 每桶秒
-    min_bucket_frames = 1
+
+    default_dt = 1.0 / float(fps) if fps > 0 else (1.0 / float(node_hz) if node_hz > 0 else 0.0)
+    if "dt" in sub.columns:
+        dt_series = pd.to_numeric(sub["dt"], errors="coerce").fillna(default_dt)
+        if default_dt > 0:
+            dt_series = dt_series.where(dt_series > 0, default_dt)
+        else:
+            dt_series = dt_series.clip(lower=0.0)
+    else:
+        dt_series = pd.Series(default_dt, index=sub.index, dtype=float)
+    dt_series = dt_series.astype(float)
+
+    def _bucket_reduce(values: pd.Series, how: str) -> pd.DataFrame:
+        df = pd.DataFrame({
+            "bucket": bucket_idx,
+            "value": values,
+            "dt": dt_series,
+        })
+        df["value"] = pd.to_numeric(df["value"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        df["dt"] = pd.to_numeric(df["dt"], errors="coerce").fillna(0.0)
+        df = df[(df["dt"] > 0.0) & df["value"].notna()]
+        if df.empty:
+            return pd.DataFrame(columns=["value", "dt"])
+        grouped = df.groupby("bucket").agg(value=("value", how), dt=("dt", "sum"))
+        grouped = grouped[grouped["dt"] > 0.0]
+        return grouped
+
+    def _apply_metric(
+        values: pd.Series,
+        how: str,
+        weight_fn,
+        prefix: str,
+        *,
+        quantile_q: float,
+        extreme: str,
+        cls_weight_mode: str = "time",
+    ) -> None:
+        bucket = _bucket_reduce(values, how)
+        if bucket.empty:
+            return
+        data = bucket.copy()
+        data["weight"] = pd.to_numeric(weight_fn(data["value"]), errors="coerce")
+        data = data.replace([np.inf, -np.inf], np.nan)
+        data = data[data["weight"].notna() & (data["dt"] > 0.0)]
+        if data.empty:
+            return
+
+        total_time = float(data["dt"].sum())
+        if total_time <= 0.0:
+            return
+
+        weight_time_avg = float(np.average(data["weight"], weights=data["dt"]))
+        if not np.isfinite(weight_time_avg):
+            return
+
+        weight_equal_avg = float(data["weight"].mean()) if len(data) else np.nan
+        if cls_weight_mode == "equal" and np.isfinite(weight_equal_avg):
+            cls_weight_avg = weight_equal_avg
+        else:
+            cls_weight_avg = weight_time_avg
+        if not np.isfinite(cls_weight_avg):
+            return
+
+        quant_label = f"p{int(round(quantile_q * 100)):02d}"
+        exposures = {
+            f"{prefix}_exp_s1": float(data.loc[np.isclose(data["weight"], 1.0), "dt"].sum()),
+            f"{prefix}_exp_s2": float(data.loc[np.isclose(data["weight"], 2.0), "dt"].sum()),
+            f"{prefix}_exp_s3": float(data.loc[np.isclose(data["weight"], 3.0), "dt"].sum()),
+        }
+
+        out.update({
+            f"{prefix}_weight_avg": cls_weight_avg,
+            f"{prefix}_cls4": cls_from_avg_weight(cls_weight_avg),
+            f"{prefix}_cls_mask": 1,
+            f"{prefix}_time_{extreme}": float(getattr(data["value"], extreme)()),
+            f"{prefix}_time_{quant_label}": weighted_percentile(data["value"], data["dt"], quantile_q),
+        })
+        if cls_weight_mode == "equal":
+            out[f"{prefix}_weight_avg_time"] = weight_time_avg
+        out.update(exposures)
 
     # ----- TTC -----
     ttc_frame_min = pd.concat(
-        [sub.get("TTC", pd.Series(dtype=float)),
-         sub.get("TTC_L", pd.Series(dtype=float)),
-         sub.get("TTC_R", pd.Series(dtype=float))],
-        axis=1
+        [
+            sub.get("TTC", pd.Series(dtype=float)),
+            sub.get("TTC_L", pd.Series(dtype=float)),
+            sub.get("TTC_R", pd.Series(dtype=float)),
+        ],
+        axis=1,
     ).min(axis=1, skipna=True)
-    g_ttc = (pd.DataFrame({"bucket": bucket_idx, "ttc": ttc_frame_min})
-             .replace([np.inf, -np.inf], np.nan).dropna())
-    if len(g_ttc):
-        ttc_bucket = (g_ttc.groupby("bucket")["ttc"]
-                        .apply(lambda s: float(np.min(s)) if len(s) >= min_bucket_frames else np.nan)
-                        .dropna())
-        w_ttc = ttc_weight_from_value(ttc_bucket).dropna()
-        if len(w_ttc):
-            TTC_weight_avg = float(w_ttc.mean())
-            out.update(
-                TTC_weight_avg=TTC_weight_avg,
-                TTC_exp_s1=float((w_ttc == 1.0).sum() * bucket_dt),
-                TTC_exp_s2=float((w_ttc == 2.0).sum() * bucket_dt),
-                TTC_exp_s3=float((w_ttc == 3.0).sum() * bucket_dt),
-                TTC_cls4=cls_from_avg_weight(TTC_weight_avg),
-                TTC_cls_mask=1,
-            )
-        else:
-            out.update(TTC_weight_avg=np.nan, TTC_exp_s1=np.nan, TTC_exp_s2=np.nan, TTC_exp_s3=np.nan,
-                       TTC_cls4=-1, TTC_cls_mask=0)
-    else:
-        out.update(TTC_weight_avg=np.nan, TTC_exp_s1=np.nan, TTC_exp_s2=np.nan, TTC_exp_s3=np.nan,
-                   TTC_cls4=-1, TTC_cls_mask=0)
+    _apply_metric(ttc_frame_min, "min", ttc_weight_from_value, "TTC", quantile_q=0.05, extreme="min")
 
     # ----- DRAC -----
     def _mask(series: pd.Series, col: str) -> pd.Series:
         return series.where(sub.get(col, pd.Series(0, index=sub.index)) == 1, np.nan)
+
     drac_frame_max = pd.concat(
-        [_mask(sub.get("DRAC",   pd.Series(dtype=float)), "DRAC_valid_mask"),
-         _mask(sub.get("DRAC_L", pd.Series(dtype=float)), "DRAC_L_valid_mask"),
-         _mask(sub.get("DRAC_R", pd.Series(dtype=float)), "DRAC_R_valid_mask")],
-        axis=1
+        [
+            _mask(sub.get("DRAC", pd.Series(dtype=float)), "DRAC_valid_mask"),
+            _mask(sub.get("DRAC_L", pd.Series(dtype=float)), "DRAC_L_valid_mask"),
+            _mask(sub.get("DRAC_R", pd.Series(dtype=float)), "DRAC_R_valid_mask"),
+        ],
+        axis=1,
     ).max(axis=1, skipna=True)
-    g_drac = (pd.DataFrame({"bucket": bucket_idx, "drac": drac_frame_max})
-              .replace([np.inf, -np.inf], np.nan).dropna())
-    if len(g_drac):
-        drac_bucket = (g_drac.groupby("bucket")["drac"]
-                         .apply(lambda s: float(np.max(s)) if len(s) >= min_bucket_frames else np.nan)
-                         .dropna())
-        w_drac = drac_weight_from_value(drac_bucket, mu=mu, grav=grav).dropna()
-        if len(w_drac):
-            DRAC_weight_avg = float(w_drac.mean())
-            out.update(
-                DRAC_weight_avg=DRAC_weight_avg,
-                DRAC_exp_s1=float((w_drac == 1.0).sum() * bucket_dt),
-                DRAC_exp_s2=float((w_drac == 2.0).sum() * bucket_dt),
-                DRAC_exp_s3=float((w_drac == 3.0).sum() * bucket_dt),
-                DRAC_cls4=cls_from_avg_weight(DRAC_weight_avg),
-                DRAC_cls_mask=1,
-            )
-        else:
-            out.update(DRAC_weight_avg=np.nan, DRAC_exp_s1=np.nan, DRAC_exp_s2=np.nan, DRAC_exp_s3=np.nan,
-                       DRAC_cls4=-1, DRAC_cls_mask=0)
-    else:
-        out.update(DRAC_weight_avg=np.nan, DRAC_exp_s1=np.nan, DRAC_exp_s2=np.nan, DRAC_exp_s3=np.nan,
-                   DRAC_cls4=-1, DRAC_cls_mask=0)
+    _apply_metric(
+        drac_frame_max,
+        "max",
+        lambda s: drac_weight_from_value(s, mu=mu, grav=grav),
+        "DRAC",
+        quantile_q=0.95,
+        extreme="max",
+    )
 
     # ----- PSD（接近掩码）-----
     psd_series = sub.get("PSD_base", pd.Series(dtype=float))
-    psd_mask   = sub.get("PSD_valid_mask", pd.Series(0, index=sub.index)).astype(bool)
-    g_psd = (pd.DataFrame({"bucket": bucket_idx, "psd": psd_series.where(psd_mask, np.nan)})
-             .replace([np.inf, -np.inf], np.nan).dropna())
-    if len(g_psd):
-        psd_bucket = (g_psd.groupby("bucket")["psd"]
-                        .apply(lambda s: float(np.min(s)) if len(s) >= min_bucket_frames else np.nan)
-                        .dropna())
-        w_psd = psd_weight_from_value(psd_bucket).dropna()
-        if len(w_psd):
-            PSD_weight_avg = float(w_psd.mean())
-            out.update(
-                PSD_cls4=cls_from_avg_weight(PSD_weight_avg),
-                PSD_cls_mask=1,
-            )
-        else:
-            out.update(PSD_cls4=-1, PSD_cls_mask=0)
-    else:
-        out.update(PSD_cls4=-1, PSD_cls_mask=0)
+    psd_mask = sub.get("PSD_valid_mask", pd.Series(0, index=sub.index)).astype(bool)
+    _apply_metric(
+        psd_series.where(psd_mask, np.nan),
+        "min",
+        psd_weight_from_value,
+        "PSD",
+        quantile_q=0.05,
+        extreme="min",
+        cls_weight_mode="equal",
+    )
 
     return out
