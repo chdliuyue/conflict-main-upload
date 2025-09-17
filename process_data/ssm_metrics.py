@@ -233,15 +233,17 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
     DRAC_base = pd.Series(np.nan, index=out.index, dtype=float)
     DRAC_base.loc[clos_mask_base] = (dv_base[clos_mask_base] ** 2) / (2.0 * D_drac_base[clos_mask_base] + EPS)
 
+    lead_v_abs = pd.to_numeric(out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce").abs()
     PSD_base = pd.Series(np.nan, index=out.index, dtype=float)
-    denom = (vf_abs ** 2) / (2.0 * mu * grav + EPS)
-    PSD_base.loc[clos_mask_base & (vf_abs > 0.0)] = D_eff_base_adj[clos_mask_base & (vf_abs > 0.0)] / (denom[clos_mask_base & (vf_abs > 0.0)] + EPS)
+    psd_denom = (vf_abs ** 2 - lead_v_abs ** 2) / (2.0 * mu * grav + EPS)
+    psd_valid = clos_mask_base & (vf_abs > 0.0) & (psd_denom > 0.0)
+    PSD_base.loc[psd_valid] = D_eff_base_adj[psd_valid] / (psd_denom[psd_valid] + EPS)
 
     out["TTC"] = TTC_base
     out["DRAC"] = DRAC_base
     out["DRAC_valid_mask"] = clos_mask_base.astype(int)
     out["PSD_base"] = PSD_base
-    out["PSD_valid_mask"] = clos_mask_base.astype(int)
+    out["PSD_valid_mask"] = psd_valid.astype(int)
 
     # L/R 候选
     for tag, cand in [("L", "leftPrecedingId"), ("R", "rightPrecedingId")]:
@@ -438,7 +440,16 @@ def compute_nodewise_labels(
         grouped = grouped[grouped["dt"] > 0.0]
         return grouped
 
-    def _apply_metric(values: pd.Series, how: str, weight_fn, prefix: str, *, quantile_q: float, extreme: str) -> None:
+    def _apply_metric(
+        values: pd.Series,
+        how: str,
+        weight_fn,
+        prefix: str,
+        *,
+        quantile_q: float,
+        extreme: str,
+        cls_weight_mode: str = "time",
+    ) -> None:
         bucket = _bucket_reduce(values, how)
         if bucket.empty:
             return
@@ -453,8 +464,16 @@ def compute_nodewise_labels(
         if total_time <= 0.0:
             return
 
-        weight_avg = float(np.average(data["weight"], weights=data["dt"]))
-        if not np.isfinite(weight_avg):
+        weight_time_avg = float(np.average(data["weight"], weights=data["dt"]))
+        if not np.isfinite(weight_time_avg):
+            return
+
+        weight_equal_avg = float(data["weight"].mean()) if len(data) else np.nan
+        if cls_weight_mode == "equal" and np.isfinite(weight_equal_avg):
+            cls_weight_avg = weight_equal_avg
+        else:
+            cls_weight_avg = weight_time_avg
+        if not np.isfinite(cls_weight_avg):
             return
 
         quant_label = f"p{int(round(quantile_q * 100)):02d}"
@@ -465,12 +484,14 @@ def compute_nodewise_labels(
         }
 
         out.update({
-            f"{prefix}_weight_avg": weight_avg,
-            f"{prefix}_cls4": cls_from_avg_weight(weight_avg),
+            f"{prefix}_weight_avg": cls_weight_avg,
+            f"{prefix}_cls4": cls_from_avg_weight(cls_weight_avg),
             f"{prefix}_cls_mask": 1,
             f"{prefix}_time_{extreme}": float(getattr(data["value"], extreme)()),
             f"{prefix}_time_{quant_label}": weighted_percentile(data["value"], data["dt"], quantile_q),
         })
+        if cls_weight_mode == "equal":
+            out[f"{prefix}_weight_avg_time"] = weight_time_avg
         out.update(exposures)
 
     # ----- TTC -----
@@ -515,6 +536,7 @@ def compute_nodewise_labels(
         "PSD",
         quantile_q=0.05,
         extreme="min",
+        cls_weight_mode="equal",
     )
 
     return out
