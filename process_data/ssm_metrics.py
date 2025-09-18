@@ -1,106 +1,68 @@
-# ssm_metrics.py
 # -*- coding: utf-8 -*-
-"""
-Surrogate Safety Measures (TTC / DRAC / PSD)
-— 统一生效条件 + 统一口径 + 节点时间聚合（含 1Hz 合桶）
-— TTC 线性口径 + 反应时间距离修正（min{D/dv, (D - v_f*τ_ttc)/dv}）
-— DRAC 含反应时间补偿，PSD 节点同口径
-
-分类规则（基于节点）：
-  TTC_node  = 节点内 min( TTC_base, TTC_L, TTC_R )
-  DRAC_node = 节点内 max( DRAC_base, DRAC_L, DRAC_R ) 〔各自有效帧〕
-  PSD_node  = 节点内 min( PSD_base ) 〔仅接近帧〕
-节点值 → 权重(0/1/2/3) → 节点平均 → 四分类；TTC/DRAC输出暴露秒（1/2/3档）。
-"""
+"""Surrogate safety metrics for the highD processing pipeline."""
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
 __all__ = [
-    "percentile", "weighted_percentile", "resolve_col",
-    "compute_frame_ssm_base", "compute_frame_ssm_union",
-    "compute_window_base_quantiles", "compute_nodewise_labels",
-    "ttc_weight_from_value", "drac_weight_from_value", "psd_weight_from_value",
-    "cls_from_avg_weight", "cls4_from_psd",
-    "SSMHyperParams", "DEFAULT_SSM_HYPER_PARAMS",
+    "percentile",
+    "weighted_percentile",
+    "resolve_col",
+    "compute_frame_ssm_base",
+    "compute_frame_ssm_union",
+    "compute_window_base_quantiles",
+    "compute_nodewise_labels",
+    "ttc_weight_from_value",
+    "drac_weight_from_value",
+    "psd_weight_from_value",
+    "cls_from_avg_weight",
+    "cls4_from_psd",
+    "SSMHyperParams",
 ]
 
-# ============================ 常量/旋钮 ============================ #
-EPS   = 1e-12
-EPS_D = 1e-3
-EPS_V = 1e-3
-MIN_VALID_FRAMES_DEFAULT = 10
-
-# 几何距离“保守收缩”：越大越敏感（拉低TTC、抬高DRAC）
-DIST_MARGIN_M   = 1.2
-LEN_MARGIN_FRAC = 0.20
-
-# 反应时间补偿
-TAU_TTC = 0.5  # 仅用于 TTC 的距离修正 D_ttc = max(D - v_f*TAU_TTC, EPS_D) 值越大高类别越多
-TAU_S   = 0.6  # DRAC 的距离修正 D_drac = max(D - v_f*TAU_S, EPS_D) 值越大高类别越多
-
-# 分档阈值
-PSD_THRS = (0.60, 0.80, 1.00)
-TTC_WEIGHT_THRS = (4.0, 3.0, 2.0)
-DRAC_RATIO_THRS = (0.5, 0.75, 0.90)
-
-# 节点合桶目标频率（把 node_hz 的节点先合成约 1 Hz 再做权重平均）
-NODE_BUCKET_HZ_TARGET = 1.0
+EPS = 1e-12
+EPS_DISTANCE = 1e-3
+EPS_SPEED = 1e-3
 
 
 @dataclass(frozen=True)
 class SSMHyperParams:
-    """可调超参数集合，控制 TTC/DRAC/PSD 的一致化逻辑。"""
+    """Hyper-parameters controlling TTC/DRAC/PSD labelling."""
 
-    dist_margin_m: float = DIST_MARGIN_M
-    len_margin_frac: float = LEN_MARGIN_FRAC
-    tau_ttc: float = TAU_TTC
-    tau_drac: float = TAU_S
-    psd_thresholds: Tuple[float, float, float] = PSD_THRS
-    ttc_weight_thresholds: Tuple[float, float, float] = TTC_WEIGHT_THRS
-    drac_ratio_thresholds: Tuple[float, float, float] = DRAC_RATIO_THRS
-    node_bucket_hz_target: float = NODE_BUCKET_HZ_TARGET
+    ttc_thresholds: Tuple[float, float, float]
+    drac_thresholds: Tuple[float, float, float]
+    psd_thresholds: Tuple[float, float, float]
+    node_bucket_hz_target: float
 
     def __post_init__(self) -> None:
-        t_psd = tuple(self.psd_thresholds)
-        if len(t_psd) != 3 or any(not np.isfinite(x) for x in t_psd):
-            raise ValueError("psd_thresholds must be a finite triple")
-        if not (t_psd[0] <= t_psd[1] <= t_psd[2]):
-            raise ValueError("psd_thresholds must be in ascending order")
+        ttc = tuple(self.ttc_thresholds)
+        drac = tuple(self.drac_thresholds)
+        psd = tuple(self.psd_thresholds)
 
-        t_ttc = tuple(self.ttc_weight_thresholds)
-        if len(t_ttc) != 3 or any(not np.isfinite(x) for x in t_ttc):
-            raise ValueError("ttc_weight_thresholds must be a finite triple")
-        if not (t_ttc[0] >= t_ttc[1] >= t_ttc[2] > 0):
-            raise ValueError(
-                "ttc_weight_thresholds must be non-increasing and positive"
-            )
+        if len(ttc) != 3 or any(not np.isfinite(v) for v in ttc):
+            raise ValueError("ttc_thresholds must contain three finite values")
+        if not (ttc[0] > ttc[1] > ttc[2] > 0.0):
+            raise ValueError("ttc_thresholds must be strictly decreasing and positive")
 
-        t_drac = tuple(self.drac_ratio_thresholds)
-        if len(t_drac) != 3 or any(not np.isfinite(x) for x in t_drac):
-            raise ValueError("drac_ratio_thresholds must be a finite triple")
-        if not (t_drac[0] <= t_drac[1] <= t_drac[2]):
-            raise ValueError("drac_ratio_thresholds must be in ascending order")
+        if len(drac) != 3 or any(not np.isfinite(v) for v in drac):
+            raise ValueError("drac_thresholds must contain three finite values")
+        if not (drac[0] < drac[1] < drac[2]):
+            raise ValueError("drac_thresholds must be strictly increasing")
 
-        if self.dist_margin_m < 0:
-            raise ValueError("dist_margin_m must be non-negative")
-        if self.len_margin_frac < 0:
-            raise ValueError("len_margin_frac must be non-negative")
-        if self.tau_ttc < 0:
-            raise ValueError("tau_ttc must be non-negative")
-        if self.tau_drac < 0:
-            raise ValueError("tau_drac must be non-negative")
-        if self.node_bucket_hz_target < 0:
-            raise ValueError("node_bucket_hz_target must be non-negative")
+        if len(psd) != 3 or any(not np.isfinite(v) for v in psd):
+            raise ValueError("psd_thresholds must contain three finite values")
+        if not (psd[0] > psd[1] > psd[2]):
+            raise ValueError("psd_thresholds must be strictly decreasing")
+
+        if not np.isfinite(self.node_bucket_hz_target) or self.node_bucket_hz_target <= 0.0:
+            raise ValueError("node_bucket_hz_target must be positive")
 
 
-DEFAULT_SSM_HYPER_PARAMS = SSMHyperParams()
-
-
-# ============================ 小工具 ============================ #
 def percentile(s: pd.Series, q_percent: float) -> float:
     s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     return float(np.percentile(s, q_percent)) if len(s) else np.nan
@@ -143,6 +105,7 @@ def weighted_percentile(values: pd.Series, weights: pd.Series, q: float) -> floa
     idx = min(max(idx, 0), len(v) - 1)
     return float(v.iloc[idx])
 
+
 def resolve_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     m = {c.lower(): c for c in df.columns}
     for name in candidates:
@@ -152,119 +115,74 @@ def resolve_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-# ============================ 帧级：基础 ============================ #
-def compute_frame_ssm_base(df: pd.DataFrame, mu: float, grav: float) -> pd.DataFrame:
-    """
-    生成帧级 TTC/DRAC/PSD_allen（基于 dhw）；最终分类用的接近掩码与几何距离在 union 中统一。
-    依赖列：ttc(可选)、dhw/spaceHeadway、xVelocity_raw、precedingXVelocity_raw、veh_len。
-    """
-    out = df.copy()
+def _attach_candidate_info_unique(
+    out: pd.DataFrame,
+    ref: pd.DataFrame,
+    cand_col: str,
+    tag: str,
+) -> pd.DataFrame:
+    """Attach leader position/velocity/length columns for the given candidate column."""
 
-    # 原始 TTC（兜底）
-    col_ttc = resolve_col(out, ["ttc"])
-    if col_ttc and col_ttc in out.columns:
-        ttc_raw = pd.to_numeric(out[col_ttc], errors="coerce").where(lambda s: s > 0.0, np.nan)
-    else:
-        ttc_raw = pd.Series(np.nan, index=out.index, dtype=float)
-
-    # 数据自带 DHW（保险杠距）
-    col_dhw = resolve_col(out, ["dhw", "spaceHeadway", "space_gap"])
-    if col_dhw and col_dhw in out.columns:
-        D_data = pd.to_numeric(out[col_dhw], errors="coerce").where(lambda s: s > 0.0, np.nan)
-    else:
-        D_data = pd.Series(np.nan, index=out.index, dtype=float)
-    out["DHW"] = D_data
-
-    # 相对速度（后-前）
-    vf = out.get("xVelocity_raw", pd.Series(np.nan, index=out.index)).astype(float)
-    vl = out.get("precedingXVelocity_raw", pd.Series(np.nan, index=out.index)).astype(float)
-    dv = vf - vl
-
-    # 线性 TTC（仅接近；基于 D_data）
-    TTC_lin = pd.Series(np.nan, index=out.index, dtype=float)
-    m_lin = D_data.notna() & (dv > EPS_V)
-    TTC_lin.loc[m_lin] = D_data[m_lin] / (dv[m_lin] + EPS)
-
-    # 帧级 TTC：原始与线性取更小（分类时会被几何口径覆盖）
-    out["TTC"] = pd.concat([ttc_raw, TTC_lin], axis=1).min(axis=1, skipna=True)
-
-    # DRAC（基于 D_data；分类时会被几何口径覆盖）
-    DRAC_base = pd.Series(np.nan, index=out.index, dtype=float)
-    m_dr = D_data.notna() & (dv > EPS_V)
-    DRAC_base.loc[m_dr] = (dv[m_dr] ** 2) / (2.0 * D_data[m_dr] + EPS)
-    out["DRAC"] = DRAC_base
-    out["DRAC_valid_mask"] = m_dr.astype(int)
-
-    # PSD_allen（p95参考，不纳入分类）
-    vf_abs = vf.abs()
-    PSD = pd.Series(np.nan, index=out.index, dtype=float)
-    m_psd = D_data.notna() & (vf_abs > 0.0)
-    denom = (vf_abs ** 2) / (2.0 * mu * grav + EPS)
-    PSD.loc[m_psd] = D_data[m_psd] / (denom[m_psd] + EPS)
-    out["PSD_allen"] = PSD.clip(lower=0.0)
-    return out
-
-
-# ============================ 帧级：几何+左右候选 ============================ #
-def _attach_candidate_info_unique(out: pd.DataFrame,
-                                  ref: pd.DataFrame,
-                                  cand_col: str, tag: str) -> pd.DataFrame:
-    """ref 在 (frame,id) 唯一；生成 {tag}_lead_x/v/len。"""
     if cand_col not in out.columns:
         out[f"{tag}_lead_x"] = np.nan
         out[f"{tag}_lead_v"] = np.nan
         out[f"{tag}_lead_len"] = np.nan
         return out
-    r = ref.rename(columns={
-        "id": "leaderId",
-        "x": f"{tag}_lead_x",
-        "xVelocity_raw": f"{tag}_lead_v",
-        "veh_len": f"{tag}_lead_len",
-    })
-    out = out.merge(r, left_on=["frame", cand_col],
-                    right_on=["frame", "leaderId"], how="left")
+
+    r = ref.rename(
+        columns={
+            "id": "leaderId",
+            "x": f"{tag}_lead_x",
+            "xVelocity_raw": f"{tag}_lead_v",
+            "veh_len": f"{tag}_lead_len",
+        }
+    )
+    out = out.merge(
+        r,
+        left_on=["frame", cand_col],
+        right_on=["frame", "leaderId"],
+        how="left",
+    )
     out.drop(columns=["leaderId"], inplace=True)
     return out
 
-def _shrink_distance(
-    D: pd.Series,
-    veh_len_f: pd.Series,
+
+def _compute_candidate_metrics(
+    gap: pd.Series,
+    follower_speed_aligned: pd.Series,
+    lead_speed_aligned: pd.Series,
+    follower_speed_abs: pd.Series,
     *,
-    params: SSMHyperParams,
-) -> pd.Series:
-    """保守收缩：D_adj = max(D - (dist_margin_m + len_margin_frac * L_f), EPS_D)"""
-    adj = (
-        float(params.dist_margin_m)
-        + float(params.len_margin_frac)
-        * pd.to_numeric(veh_len_f, errors="coerce").fillna(0.0)
-    )
-    return pd.Series(
-        np.maximum((pd.to_numeric(D, errors="coerce") - adj).astype(float), EPS_D),
-        index=D.index,
-    )
+    mu: float,
+    grav: float,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Compute TTC/DRAC/PSD for a follower-leader pair given the gap and speeds."""
 
-def _ttc_linear_with_reaction(
-    D: pd.Series,
-    dv: pd.Series,
-    v_f: pd.Series,
-    *,
-    params: SSMHyperParams,
-) -> pd.Series:
-    """
-    线性 TTC 两路并取最小：
-      TTC_lin = D / dv
-      TTC_rt  = max(D - v_f*tau_ttc, EPS_D) / dv
-    仅对 dv>0 生效。
-    """
-    TTC_lin = pd.Series(np.nan, index=D.index, dtype=float)
-    TTC_rt  = pd.Series(np.nan, index=D.index, dtype=float)
-    m = (D > EPS_D) & (dv > EPS_V)
+    gap = pd.to_numeric(gap, errors="coerce")
+    follower_speed_aligned = pd.to_numeric(follower_speed_aligned, errors="coerce")
+    lead_speed_aligned = pd.to_numeric(lead_speed_aligned, errors="coerce")
+    follower_speed_abs = pd.to_numeric(follower_speed_abs, errors="coerce").clip(lower=0.0)
 
-    TTC_lin.loc[m] = D[m] / (dv[m] + EPS)
-    D_rt = np.maximum(D - v_f * float(params.tau_ttc), EPS_D)
-    TTC_rt.loc[m]  = D_rt[m] / (dv[m] + EPS)
+    dv = follower_speed_aligned - lead_speed_aligned
+    closing = (gap > EPS_DISTANCE) & (dv > EPS_SPEED)
 
-    return pd.concat([TTC_lin, TTC_rt], axis=1).min(axis=1, skipna=True)
+    ttc = pd.Series(np.nan, index=gap.index, dtype=float)
+    ttc.loc[closing] = gap.loc[closing] / (dv.loc[closing] + EPS)
+
+    drac = pd.Series(np.nan, index=gap.index, dtype=float)
+    drac.loc[closing] = (dv.loc[closing] ** 2) / (2.0 * gap.loc[closing] + EPS)
+
+    drac_mask = closing.astype(int)
+
+    denom = (follower_speed_abs ** 2) / (2.0 * float(mu) * float(grav) + EPS)
+    psd_valid = closing & (denom > EPS)
+
+    psd = pd.Series(np.nan, index=gap.index, dtype=float)
+    psd.loc[psd_valid] = gap.loc[psd_valid] / (denom.loc[psd_valid] + EPS)
+
+    psd_mask = psd_valid.astype(int)
+    return ttc, drac, drac_mask, psd, psd_mask
+
 
 def compute_frame_ssm_union(
     df_lane: pd.DataFrame,
@@ -272,191 +190,246 @@ def compute_frame_ssm_union(
     grav: float,
     inc: bool,
     *,
-    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+    params: SSMHyperParams,
 ) -> pd.DataFrame:
-    """
-    统一“接近”与距离口径，并并入左右候选：
-      base：D_eff_base_adj = shrink( min(dhw, D_net_base) )
-            TTC_base = min( D_eff_base_adj/dv_base , (D_eff_base_adj - v_f*tau_ttc)/dv_base )
-            DRAC_base 用 D_drac_base = max(D_eff_base_adj - v_f*tau_drac, EPS_D)
-            PSD_base = D_eff_base_adj / (v_f^2/(2μg))
-            接近掩码 clos_mask_base = (D_eff_base_adj>0 & Δv_base>0)
-      L/R： D_adj_{L/R} = shrink(D_net_{L/R})
-            TTC_{L/R} = min( D_adj_{L/R}/dv_{L/R} , (D_adj_{L/R} - v_f*tau_ttc)/dv_{L/R} )
-            DRAC_{L/R} 用 D_drac_{L/R} = max(D_adj_{L/R} - v_f*tau_drac, EPS_D)
-    """
-    leaders_ref = (df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
-                   .drop_duplicates(subset=["frame", "id"]))
+    """Compute TTC/DRAC/PSD for the main, left and right leaders of a lane."""
 
-    out = compute_frame_ssm_base(df_lane, mu=mu, grav=grav).reset_index(drop=True)
-    out["x_dir"] = out["x"] if inc else -out["x"]
+    if params is None:
+        raise ValueError("params must be provided")
+
+    out = df_lane.copy().reset_index(drop=True)
+
+    dhw_col = resolve_col(out, ["dhw", "spaceHeadway", "space_gap"])
+    if dhw_col:
+        out["DHW"] = pd.to_numeric(out[dhw_col], errors="coerce")
+    else:
+        out["DHW"] = np.nan
+
+    leaders_ref = (
+        df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
+        .drop_duplicates(subset=["frame", "id"])
+    )
+
+    out = _attach_candidate_info_unique(out, leaders_ref, "precedingId", "B")
+    out = _attach_candidate_info_unique(out, leaders_ref, "leftPrecedingId", "L")
+    out = _attach_candidate_info_unique(out, leaders_ref, "rightPrecedingId", "R")
+
+    x_aligned = pd.to_numeric(out["x"], errors="coerce")
+    x_aligned = x_aligned if inc else -x_aligned
+
+    follower_len = pd.to_numeric(out.get("veh_len"), errors="coerce").fillna(0.0)
 
     vf_raw = pd.to_numeric(
-        out.get("xVelocity_raw", pd.Series(np.nan, index=out.index)), errors="coerce"
+        out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
+        errors="coerce",
     )
     vf_aligned = vf_raw if inc else -vf_raw
-    vf_speed = vf_aligned.clip(lower=0.0)
+    vf_abs = vf_aligned.clip(lower=0.0)
 
-    # base
-    out = _attach_candidate_info_unique(out, leaders_ref, "precedingId", "B")
-    B_x_dir = (out["B_lead_x"] if inc else -out["B_lead_x"])
-    D_center = B_x_dir - out["x_dir"]
-    D_net_base = D_center - 0.5 * (out["B_lead_len"] + out["veh_len"])
-    D_eff_base = pd.concat([out["DHW"], D_net_base], axis=1).min(axis=1, skipna=True)
-    D_eff_base_adj = _shrink_distance(D_eff_base, out["veh_len"], params=params)
-    lead_v_base = pd.to_numeric(
-        out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
-    )
-    lead_v_aligned = lead_v_base if inc else -lead_v_base
-    dv_base = vf_aligned - lead_v_aligned
+    def _compute_gap(tag: str) -> Tuple[pd.Series, pd.Series]:
+        lead_x = pd.to_numeric(out.get(f"{tag}_lead_x"), errors="coerce")
+        lead_x = lead_x if inc else -lead_x
+        lead_len = pd.to_numeric(out.get(f"{tag}_lead_len"), errors="coerce").fillna(0.0)
+        gap_center = lead_x - x_aligned
+        gap = gap_center - 0.5 * (lead_len + follower_len)
+        gap = gap.where(gap > EPS_DISTANCE)
 
-    clos_mask_base = (D_eff_base_adj > EPS_D) & (dv_base > EPS_V)
+        lead_v = pd.to_numeric(out.get(f"{tag}_lead_v"), errors="coerce")
+        lead_v_aligned = lead_v if inc else -lead_v
+        return gap, lead_v_aligned
 
-    TTC_base = _ttc_linear_with_reaction(D_eff_base_adj, dv_base, vf_speed, params=params)
-
-    D_drac_base = pd.Series(
-        np.maximum(D_eff_base_adj - vf_speed * float(params.tau_drac), EPS_D),
-        index=out.index,
-        dtype=float,
-    )
-    DRAC_base = pd.Series(np.nan, index=out.index, dtype=float)
-    DRAC_base.loc[clos_mask_base] = (dv_base[clos_mask_base] ** 2) / (
-        2.0 * D_drac_base[clos_mask_base] + EPS
+    gap_base, lead_v_base = _compute_gap("B")
+    ttc_base, drac_base, drac_mask, psd_base, psd_mask = _compute_candidate_metrics(
+        gap_base,
+        vf_aligned,
+        lead_v_base,
+        vf_abs,
+        mu=mu,
+        grav=grav,
     )
 
-    lead_speed = lead_v_aligned.clip(lower=0.0)
-    PSD_base = pd.Series(np.nan, index=out.index, dtype=float)
-    psd_denom = (vf_speed ** 2 - lead_speed ** 2) / (2.0 * mu * grav + EPS)
-    psd_valid = clos_mask_base & (vf_speed > EPS_V) & (psd_denom > 0.0)
-    PSD_base.loc[psd_valid] = D_eff_base_adj[psd_valid] / (psd_denom[psd_valid] + EPS)
+    out["TTC"] = ttc_base
+    out["DRAC"] = drac_base
+    out["DRAC_valid_mask"] = drac_mask.astype(int)
+    out["PSD_base"] = psd_base
+    out["PSD_valid_mask"] = psd_mask.astype(int)
+    out["PSD_allen"] = psd_base
 
-    out["TTC"] = TTC_base
-    out["DRAC"] = DRAC_base
-    out["DRAC_valid_mask"] = clos_mask_base.astype(int)
-    out["PSD_base"] = PSD_base
-    out["PSD_valid_mask"] = psd_valid.astype(int)
-
-    # L/R 候选
-    for tag, cand in [("L", "leftPrecedingId"), ("R", "rightPrecedingId")]:
-        out = _attach_candidate_info_unique(out, leaders_ref, cand, tag)
-        lead_x_dir = (out[f"{tag}_lead_x"] if inc else -out[f"{tag}_lead_x"])
-        D_center = lead_x_dir - out["x_dir"]
-        D_net = D_center - 0.5 * (out[f"{tag}_lead_len"] + out["veh_len"])
-        D_adj = _shrink_distance(D_net, out["veh_len"], params=params)
-        lead_v_tag = pd.to_numeric(
-            out.get(f"{tag}_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
+    for tag in ("L", "R"):
+        gap_tag, lead_v_tag = _compute_gap(tag)
+        ttc_tag, drac_tag, drac_tag_mask, _, _ = _compute_candidate_metrics(
+            gap_tag,
+            vf_aligned,
+            lead_v_tag,
+            vf_abs,
+            mu=mu,
+            grav=grav,
         )
-        lead_v_tag_aligned = lead_v_tag if inc else -lead_v_tag
-        dv_tag = vf_aligned - lead_v_tag_aligned
-
-        m = (D_adj > EPS_D) & (dv_tag > EPS_V)
-        TTC_tag = _ttc_linear_with_reaction(D_adj, dv_tag, vf_speed, params=params)
-        out[f"TTC_{tag}"] = np.nan
-        out.loc[m, f"TTC_{tag}"] = TTC_tag[m]
-
-        D_drac_tag = pd.Series(
-            np.maximum(D_adj - vf_speed * float(params.tau_drac), EPS_D),
-            index=out.index,
-            dtype=float,
-        )
-        out[f"DRAC_{tag}"] = np.nan
-        out[f"DRAC_{tag}_valid_mask"] = 0
-        out.loc[m, f"DRAC_{tag}"] = ((dv_tag ** 2) / (2.0 * D_drac_tag + EPS))[m]
-        out.loc[m, f"DRAC_{tag}_valid_mask"] = 1
+        out[f"TTC_{tag}"] = ttc_tag
+        out[f"DRAC_{tag}"] = drac_tag
+        out[f"DRAC_{tag}_valid_mask"] = drac_tag_mask.astype(int)
 
     return out
 
 
-# ============================ 权重/分类映射 ============================ #
+def compute_frame_ssm_base(
+    df_lane: pd.DataFrame,
+    mu: float,
+    grav: float,
+    inc: bool,
+    *,
+    params: SSMHyperParams,
+) -> pd.DataFrame:
+    """Return the base follower-leader metrics without side candidates."""
+
+    union_df = compute_frame_ssm_union(df_lane, mu=mu, grav=grav, inc=inc, params=params)
+    drop_cols = [
+        "TTC_L",
+        "TTC_R",
+        "DRAC_L",
+        "DRAC_R",
+        "DRAC_L_valid_mask",
+        "DRAC_R_valid_mask",
+        "L_lead_x",
+        "L_lead_v",
+        "L_lead_len",
+        "R_lead_x",
+        "R_lead_v",
+        "R_lead_len",
+        "L_lead_gap",
+        "R_lead_gap",
+    ]
+    return union_df.drop(columns=[c for c in drop_cols if c in union_df.columns])
+
+
 def ttc_weight_from_value(
     ttc_val: pd.Series | float,
     *,
-    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+    params: SSMHyperParams,
 ) -> pd.Series | float:
-    """TTC>thr0→0；(thr1,thr0]→1；(thr2,thr1]→2；(0,thr2]→3。"""
-    thr0, thr1, thr2 = params.ttc_weight_thresholds
-    if np.isscalar(ttc_val):
-        t = float(ttc_val) if np.isfinite(ttc_val) else np.nan
-        if not np.isfinite(t) or t <= 0: return np.nan
-        if t > thr0: return 0.0
-        if t > thr1: return 1.0
-        if t > thr2: return 2.0
+    """Map TTC values to ordinal risk weights according to ``params.ttc_thresholds``."""
+
+    thr_safe, thr_low, thr_mid = params.ttc_thresholds
+
+    def _scalar(ttc: float) -> float:
+        if not np.isfinite(ttc) or ttc <= 0:
+            return np.nan
+        if ttc > thr_safe:
+            return 0.0
+        if ttc > thr_low:
+            return 1.0
+        if ttc > thr_mid:
+            return 2.0
         return 3.0
+
+    if np.isscalar(ttc_val):
+        return _scalar(float(ttc_val))
+
     t = pd.to_numeric(ttc_val, errors="coerce")
     w = pd.Series(np.nan, index=t.index, dtype=float)
-    w[t > thr0] = 0.0
-    w[(t > thr1) & (t <= thr0)] = 1.0
-    w[(t > thr2) & (t <= thr1)] = 2.0
-    w[(t > 0.0) & (t <= thr2)] = 3.0
+    w[t > thr_safe] = 0.0
+    w[(t <= thr_safe) & (t > thr_low)] = 1.0
+    w[(t <= thr_low) & (t > thr_mid)] = 2.0
+    w[(t > 0.0) & (t <= thr_mid)] = 3.0
     return w
+
 
 def drac_weight_from_value(
     drac_val: pd.Series | float,
     mu: float,
     grav: float,
     *,
-    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+    params: SSMHyperParams,
 ) -> pd.Series | float:
-    """r=DRAC/(μg)：r<thr0→0；[thr0,thr1)→1；[thr1,thr2)→2；≥thr2→3。"""
-    amax = float(mu) * float(grav)
-    thr0, thr1, thr2 = params.drac_ratio_thresholds
-    if np.isscalar(drac_val):
-        d = float(drac_val) if np.isfinite(drac_val) else np.nan
-        if not np.isfinite(d) or d <= 0: return np.nan
-        r = d / (amax + EPS)
-        if r < thr0: return 0.0
-        if r < thr1: return 1.0
-        if r < thr2: return 2.0
+    """Map DRAC values to ordinal risk weights according to ``params.drac_thresholds``."""
+
+    thr_low, thr_mid, thr_high = params.drac_thresholds
+
+    def _scalar(drac: float) -> float:
+        if not np.isfinite(drac) or drac <= 0:
+            return np.nan
+        if drac < thr_low:
+            return 0.0
+        if drac < thr_mid:
+            return 1.0
+        if drac < thr_high:
+            return 2.0
         return 3.0
-    r = pd.to_numeric(drac_val, errors="coerce") / (amax + EPS)
-    w = pd.Series(np.nan, index=r.index, dtype=float)
-    w[r < thr0] = 0.0
-    w[(r >= thr0) & (r < thr1)] = 1.0
-    w[(r >= thr1) & (r < thr2)] = 2.0
-    w[r >= thr2] = 3.0
+
+    if np.isscalar(drac_val):
+        return _scalar(float(drac_val))
+
+    d = pd.to_numeric(drac_val, errors="coerce")
+    w = pd.Series(np.nan, index=d.index, dtype=float)
+    w[d < thr_low] = 0.0
+    w[(d >= thr_low) & (d < thr_mid)] = 1.0
+    w[(d >= thr_mid) & (d < thr_high)] = 2.0
+    w[d >= thr_high] = 3.0
     return w
+
 
 def psd_weight_from_value(
     psd_val: pd.Series | float,
     *,
-    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+    params: SSMHyperParams,
 ) -> pd.Series | float:
-    """PSD<thr0→3；[thr0,thr1)→2；[thr1,thr2)→1；≥thr2→0。"""
-    t1, t2, t3 = params.psd_thresholds
+    """Map PSD values to ordinal risk weights according to ``params.psd_thresholds``."""
+
+    thr_safe, thr_low, thr_mid = params.psd_thresholds
+
+    def _scalar(psd: float) -> float:
+        if not np.isfinite(psd):
+            return np.nan
+        if psd >= thr_safe:
+            return 0.0
+        if psd >= thr_low:
+            return 1.0
+        if psd >= thr_mid:
+            return 2.0
+        return 3.0
+
     if np.isscalar(psd_val):
-        p = float(psd_val) if np.isfinite(psd_val) else np.nan
-        if not np.isfinite(p) or p <= 0: return np.nan
-        if p < t1: return 3.0
-        if p < t2: return 2.0
-        if p < t3: return 1.0
-        return 0.0
+        return _scalar(float(psd_val))
+
     p = pd.to_numeric(psd_val, errors="coerce")
     w = pd.Series(np.nan, index=p.index, dtype=float)
-    w[p < t1] = 3.0
-    w[(p >= t1) & (p < t2)] = 2.0
-    w[(p >= t2) & (p < t3)] = 1.0
-    w[p >= t3] = 0.0
+    w[p >= thr_safe] = 0.0
+    w[(p < thr_safe) & (p >= thr_low)] = 1.0
+    w[(p < thr_low) & (p >= thr_mid)] = 2.0
+    w[p < thr_mid] = 3.0
     return w
 
+
 def cls_from_avg_weight(avg_w: float) -> int:
-    """平均权重 → 四分类：0、1、2、3；无效 -1。"""
-    if not np.isfinite(avg_w): return -1
-    if abs(avg_w) < 1e-12: return 0
-    if 0.0 < avg_w <= 1.0: return 1
-    if 1.0 < avg_w <= 2.0: return 2
+    """Convert averaged ordinal weight to a four-class label."""
+
+    if not np.isfinite(avg_w):
+        return -1
+    if abs(avg_w) < 1e-12:
+        return 0
+    if 0.0 < avg_w <= 1.0:
+        return 1
+    if 1.0 < avg_w <= 2.0:
+        return 2
     return 3
 
-def cls4_from_psd(psd_p95: float, *, params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS) -> int:
-    """仅用于窗口 p95 的四分类（参考）。"""
-    if not np.isfinite(psd_p95): return -1
-    t1, t2, t3 = params.psd_thresholds
-    if psd_p95 < t1: return 3
-    elif psd_p95 < t2: return 2
-    elif psd_p95 < t3: return 1
-    else: return 0
+
+def cls4_from_psd(psd_p95: float, *, params: SSMHyperParams) -> int:
+    if not np.isfinite(psd_p95):
+        return -1
+    thr_safe, thr_low, thr_mid = params.psd_thresholds
+    if psd_p95 >= thr_safe:
+        return 0
+    if psd_p95 >= thr_low:
+        return 1
+    if psd_p95 >= thr_mid:
+        return 2
+    return 3
 
 
-# ============================ 窗口分位（参考） ============================ #
+MIN_VALID_FRAMES_DEFAULT = 10
+
+
 def compute_window_base_quantiles(
     sub: pd.DataFrame,
     *,
@@ -464,15 +437,18 @@ def compute_window_base_quantiles(
 ) -> Dict[str, float]:
     out: Dict[str, float] = {}
 
-    # TTC_p05：按车“帧级最小(含L/R)”再跨车 p05；不足回退帧级
     ttc_min_frame = pd.concat(
-        [sub.get("TTC", pd.Series(dtype=float)),
-         sub.get("TTC_L", pd.Series(dtype=float)),
-         sub.get("TTC_R", pd.Series(dtype=float))],
-        axis=1
+        [
+            sub.get("TTC", pd.Series(dtype=float)),
+            sub.get("TTC_L", pd.Series(dtype=float)),
+            sub.get("TTC_R", pd.Series(dtype=float)),
+        ],
+        axis=1,
     ).min(axis=1, skipna=True)
-    t_perveh_min = (pd.DataFrame({"id": sub["id"].values, "t": ttc_min_frame})
-                      .dropna()["t"].groupby(sub["id"]).min())
+    t_perveh_min = (
+        pd.DataFrame({"id": sub["id"].values, "t": ttc_min_frame})
+        .dropna()["t"].groupby(sub["id"]).min()
+    )
     nveh = int(sub["id"].nunique())
     need = max(2, min(5, int(np.ceil(0.10 * max(1, nveh)))))
     if len(t_perveh_min) >= need:
@@ -481,49 +457,50 @@ def compute_window_base_quantiles(
         t_frames = ttc_min_frame.replace([np.inf, -np.inf], np.nan).dropna()
         out["TTC_p05"] = percentile(t_frames, 5.0) if len(t_frames) >= min_valid_frames else np.nan
 
-    # DRAC_p95：三路有效并集按车最大 → 跨车 p95；不足回退帧级
     def _mask(series: pd.Series, mask_col: str) -> pd.Series:
         return series.where(sub.get(mask_col, pd.Series(0, index=sub.index)) == 1, np.nan)
+
     drac_max_frame = pd.concat(
-        [_mask(sub.get("DRAC",   pd.Series(dtype=float)), "DRAC_valid_mask"),
-         _mask(sub.get("DRAC_L", pd.Series(dtype=float)), "DRAC_L_valid_mask"),
-         _mask(sub.get("DRAC_R", pd.Series(dtype=float)), "DRAC_R_valid_mask")],
-        axis=1
+        [
+            _mask(sub.get("DRAC", pd.Series(dtype=float)), "DRAC_valid_mask"),
+            _mask(sub.get("DRAC_L", pd.Series(dtype=float)), "DRAC_L_valid_mask"),
+            _mask(sub.get("DRAC_R", pd.Series(dtype=float)), "DRAC_R_valid_mask"),
+        ],
+        axis=1,
     ).max(axis=1, skipna=True)
-    a_perveh_max = (pd.DataFrame({"id": sub["id"].values, "a": drac_max_frame})
-                      .dropna()["a"].groupby(sub["id"]).max())
+    a_perveh_max = (
+        pd.DataFrame({"id": sub["id"].values, "a": drac_max_frame})
+        .dropna()["a"].groupby(sub["id"]).max()
+    )
     if len(a_perveh_max) >= need:
         out["DRAC_p95"] = percentile(a_perveh_max, 95.0)
     else:
         a_frames = drac_max_frame.replace([np.inf, -np.inf], np.nan).dropna()
         out["DRAC_p95"] = percentile(a_frames, 95.0) if len(a_frames) >= min_valid_frames else np.nan
 
-    # PSD_p95（仍用 PSD_allen；仅参考）
-    psd_series = sub.get("PSD_allen", pd.Series(dtype=float)).replace([np.inf, -np.inf], np.nan).dropna()
+    psd_series = (
+        sub.get("PSD_allen", pd.Series(dtype=float))
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
     out["PSD_p95"] = percentile(psd_series, 95.0) if len(psd_series) else np.nan
     return out
 
 
-# ============================ 节点级分类（含 1Hz 合桶） ============================ #
 def compute_nodewise_labels(
     sub: pd.DataFrame,
     *,
     t0: float,
     fps: float,
     node_hz: float,
-    ttc_q_low: float,    # 未用（保留签名）
-    drac_q_high: float,  # 未用（保留签名）
+    ttc_q_low: float,
+    drac_q_high: float,
     mu: float,
     grav: float,
-    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+    params: SSMHyperParams,
 ) -> Dict[str, float]:
-    """
-    统一时间聚合（节点） + 合桶：
-      1) 原始节点 index = floor((t - t0)*node_hz)
-      2) bucket_factor = round(node_hz / node_bucket_hz_target)；bucket = node // factor
-      3) 节点值：TTC→min；DRAC→max（有效并集）；PSD→min（接近掩码）
-      4) 权重映射并对“桶节点”求平均
-    """
+    """Aggregate per-frame metrics into node-wise ordinal labels."""
+
     out: Dict[str, float] = {}
 
     node_idx = np.floor((sub["time"].values - float(t0)) * float(node_hz)).astype("int64")
@@ -615,7 +592,6 @@ def compute_nodewise_labels(
             out[f"{prefix}_weight_avg_time"] = weight_time_avg
         out.update(exposures)
 
-    # ----- TTC -----
     ttc_frame_min = pd.concat(
         [
             sub.get("TTC", pd.Series(dtype=float)),
@@ -629,11 +605,10 @@ def compute_nodewise_labels(
         "min",
         lambda s: ttc_weight_from_value(s, params=params),
         "TTC",
-        quantile_q=0.05,
+        quantile_q=float(ttc_q_low),
         extreme="min",
     )
 
-    # ----- DRAC -----
     def _mask(series: pd.Series, col: str) -> pd.Series:
         return series.where(sub.get(col, pd.Series(0, index=sub.index)) == 1, np.nan)
 
@@ -650,11 +625,10 @@ def compute_nodewise_labels(
         "max",
         lambda s: drac_weight_from_value(s, mu=mu, grav=grav, params=params),
         "DRAC",
-        quantile_q=0.95,
+        quantile_q=float(drac_q_high),
         extreme="max",
     )
 
-    # ----- PSD（接近掩码）-----
     psd_series = sub.get("PSD_base", pd.Series(dtype=float))
     psd_mask = sub.get("PSD_valid_mask", pd.Series(0, index=sub.index)).astype(bool)
     _apply_metric(
@@ -662,7 +636,7 @@ def compute_nodewise_labels(
         "min",
         lambda s: psd_weight_from_value(s, params=params),
         "PSD",
-        quantile_q=0.05,
+        quantile_q=float(ttc_q_low),
         extreme="min",
         cls_weight_mode="equal",
     )
