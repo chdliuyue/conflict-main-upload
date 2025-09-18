@@ -34,12 +34,25 @@ EPS_SPEED = 1e-3
 class SSMHyperParams:
     """Hyper-parameters controlling TTC/DRAC/PSD labelling."""
 
+    dist_margin_m: float
+    len_margin_frac: float
+    tau_ttc: float
+    tau_drac: float
     ttc_thresholds: Tuple[float, float, float]
     drac_thresholds: Tuple[float, float, float]
     psd_thresholds: Tuple[float, float, float]
     node_bucket_hz_target: float
 
     def __post_init__(self) -> None:
+        if not np.isfinite(self.dist_margin_m) or self.dist_margin_m < 0.0:
+            raise ValueError("dist_margin_m must be non-negative")
+        if not np.isfinite(self.len_margin_frac) or self.len_margin_frac < 0.0:
+            raise ValueError("len_margin_frac must be non-negative")
+        if not np.isfinite(self.tau_ttc) or self.tau_ttc < 0.0:
+            raise ValueError("tau_ttc must be non-negative")
+        if not np.isfinite(self.tau_drac) or self.tau_drac < 0.0:
+            raise ValueError("tau_drac must be non-negative")
+
         ttc = tuple(self.ttc_thresholds)
         drac = tuple(self.drac_thresholds)
         psd = tuple(self.psd_thresholds)
@@ -56,8 +69,8 @@ class SSMHyperParams:
 
         if len(psd) != 3 or any(not np.isfinite(v) for v in psd):
             raise ValueError("psd_thresholds must contain three finite values")
-        if not (psd[0] > psd[1] > psd[2]):
-            raise ValueError("psd_thresholds must be strictly decreasing")
+        if not (psd[0] > psd[1] > psd[2] >= 0.0):
+            raise ValueError("psd_thresholds must be strictly decreasing and non-negative")
 
         if not np.isfinite(self.node_bucket_hz_target) or self.node_bucket_hz_target <= 0.0:
             raise ValueError("node_bucket_hz_target must be positive")
@@ -147,41 +160,50 @@ def _attach_candidate_info_unique(
     return out
 
 
-def _compute_candidate_metrics(
-    gap: pd.Series,
-    follower_speed_aligned: pd.Series,
-    lead_speed_aligned: pd.Series,
-    follower_speed_abs: pd.Series,
+def _shrink_distance(
+    distance: pd.Series,
+    follower_len: pd.Series,
     *,
-    mu: float,
-    grav: float,
-) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-    """Compute TTC/DRAC/PSD for a follower-leader pair given the gap and speeds."""
+    params: SSMHyperParams,
+) -> pd.Series:
+    """Apply geometric margins to the bumper-to-bumper spacing."""
 
-    gap = pd.to_numeric(gap, errors="coerce")
-    follower_speed_aligned = pd.to_numeric(follower_speed_aligned, errors="coerce")
-    lead_speed_aligned = pd.to_numeric(lead_speed_aligned, errors="coerce")
-    follower_speed_abs = pd.to_numeric(follower_speed_abs, errors="coerce").clip(lower=0.0)
+    dist = pd.to_numeric(distance, errors="coerce")
+    follower = pd.to_numeric(follower_len, errors="coerce").fillna(0.0)
+    margin = float(params.dist_margin_m) + float(params.len_margin_frac) * follower
+    shrunk = np.maximum((dist - margin).astype(float), EPS_DISTANCE)
+    return pd.Series(shrunk, index=dist.index, dtype=float)
 
-    dv = follower_speed_aligned - lead_speed_aligned
-    closing = (gap > EPS_DISTANCE) & (dv > EPS_SPEED)
+def _ttc_linear_with_reaction(
+    distance: pd.Series,
+    dv: pd.Series,
+    v_f: pd.Series,
+    follower_speed: pd.Series,
+    *,
+    params: SSMHyperParams,
+) -> pd.Series:
+    """Return min(D/dv, max(D - v_f*tau_ttc, EPS)/dv) for dv>0."""
 
-    ttc = pd.Series(np.nan, index=gap.index, dtype=float)
-    ttc.loc[closing] = gap.loc[closing] / (dv.loc[closing] + EPS)
+    D = pd.to_numeric(distance, errors="coerce")
+    closing_speed = pd.to_numeric(dv, errors="coerce")
+    vf = pd.to_numeric(follower_speed, errors="coerce").clip(lower=0.0)
 
-    drac = pd.Series(np.nan, index=gap.index, dtype=float)
-    drac.loc[closing] = (dv.loc[closing] ** 2) / (2.0 * gap.loc[closing] + EPS)
+    ttc_lin = pd.Series(np.nan, index=D.index, dtype=float)
+    ttc_rt = pd.Series(np.nan, index=D.index, dtype=float)
 
-    drac_mask = closing.astype(int)
+    mask = (D > EPS_DISTANCE) & (closing_speed > EPS_SPEED)
+    denom = closing_speed.loc[mask] + EPS
 
-    denom = (follower_speed_abs ** 2) / (2.0 * float(mu) * float(grav) + EPS)
-    psd_valid = closing & (denom > EPS)
+    ttc_lin.loc[mask] = D.loc[mask] / denom
 
-    psd = pd.Series(np.nan, index=gap.index, dtype=float)
-    psd.loc[psd_valid] = gap.loc[psd_valid] / (denom.loc[psd_valid] + EPS)
+    D_rt = pd.Series(
+        np.maximum((D - vf * float(params.tau_ttc)).astype(float), EPS_DISTANCE),
+        index=D.index,
+        dtype=float,
+    )
+    ttc_rt.loc[mask] = D_rt.loc[mask] / denom
 
-    psd_mask = psd_valid.astype(int)
-    return ttc, drac, drac_mask, psd, psd_mask
+    return pd.concat([ttc_lin, ttc_rt], axis=1).min(axis=1, skipna=True)
 
 
 def compute_frame_ssm_union(
@@ -199,12 +221,6 @@ def compute_frame_ssm_union(
 
     out = df_lane.copy().reset_index(drop=True)
 
-    dhw_col = resolve_col(out, ["dhw", "spaceHeadway", "space_gap"])
-    if dhw_col:
-        out["DHW"] = pd.to_numeric(out[dhw_col], errors="coerce")
-    else:
-        out["DHW"] = np.nan
-
     leaders_ref = (
         df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
         .drop_duplicates(subset=["frame", "id"])
@@ -214,92 +230,146 @@ def compute_frame_ssm_union(
     out = _attach_candidate_info_unique(out, leaders_ref, "leftPrecedingId", "L")
     out = _attach_candidate_info_unique(out, leaders_ref, "rightPrecedingId", "R")
 
-    x_aligned = pd.to_numeric(out["x"], errors="coerce")
-    x_aligned = x_aligned if inc else -x_aligned
-
+    x_dir = pd.to_numeric(out.get("x"), errors="coerce")
+    x_dir = x_dir if inc else -x_dir
     follower_len = pd.to_numeric(out.get("veh_len"), errors="coerce").fillna(0.0)
 
     vf_raw = pd.to_numeric(
         out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
-        errors="coerce",
+    errors = "coerce",
     )
     vf_aligned = vf_raw if inc else -vf_raw
-    vf_abs = vf_aligned.clip(lower=0.0)
+    vf_speed = vf_aligned.clip(lower=0.0)
 
-    def _compute_gap(tag: str) -> Tuple[pd.Series, pd.Series]:
-        lead_x = pd.to_numeric(out.get(f"{tag}_lead_x"), errors="coerce")
-        lead_x = lead_x if inc else -lead_x
-        lead_len = pd.to_numeric(out.get(f"{tag}_lead_len"), errors="coerce").fillna(0.0)
-        gap_center = lead_x - x_aligned
-        gap = gap_center - 0.5 * (lead_len + follower_len)
-        gap = gap.where(gap > EPS_DISTANCE)
-
-        lead_v = pd.to_numeric(out.get(f"{tag}_lead_v"), errors="coerce")
-        lead_v_aligned = lead_v if inc else -lead_v
-        return gap, lead_v_aligned
-
-    gap_base, lead_v_base = _compute_gap("B")
-    ttc_base, drac_base, drac_mask, psd_base, psd_mask = _compute_candidate_metrics(
-        gap_base,
-        vf_aligned,
-        lead_v_base,
-        vf_abs,
-        mu=mu,
-        grav=grav,
+    base_lead_x = pd.to_numeric(out.get("B_lead_x"), errors="coerce")
+    base_lead_x = base_lead_x if inc else -base_lead_x
+    base_lead_len = pd.to_numeric(out.get("B_lead_len"), errors="coerce").fillna(0.0)
+    D_center = base_lead_x - x_dir
+    D_net = D_center - 0.5 * (base_lead_len + follower_len)
+    D_eff = pd.concat([out.get("DHW", pd.Series(dtype=float)), D_net], axis=1).min(
+        axis=1, skipna=True
     )
+    D_adj = _shrink_distance(D_eff, follower_len, params=params)
+
+    lead_v_base = pd.to_numeric(out.get("B_lead_v"), errors="coerce")
+    lead_v_aligned = lead_v_base if inc else -lead_v_base
+    dv_base = vf_aligned - lead_v_aligned
+
+    closing_mask = (D_adj > EPS_DISTANCE) & (dv_base > EPS_SPEED)
+
+    ttc_base = _ttc_linear_with_reaction(D_adj, dv_base, vf_speed, params=params)
+
+    D_drac = pd.Series(
+        np.maximum((D_adj - vf_speed * float(params.tau_drac)).astype(float), EPS_DISTANCE),
+        index=out.index,
+        dtype=float,
+    )
+    drac_base = pd.Series(np.nan, index=out.index, dtype=float)
+    drac_base.loc[closing_mask] = (dv_base.loc[closing_mask] ** 2) / (
+            2.0 * D_drac.loc[closing_mask] + EPS
+    )
+
+    lead_speed = lead_v_aligned.clip(lower=0.0)
+    psd_denom = (vf_speed ** 2 - lead_speed ** 2) / (2.0 * float(mu) * float(grav) + EPS)
+    psd_valid = closing_mask & (vf_speed > EPS_SPEED) & (psd_denom > EPS_DISTANCE)
+    psd_base = pd.Series(np.nan, index=out.index, dtype=float)
+    psd_base.loc[psd_valid] = D_adj.loc[psd_valid] / (psd_denom.loc[psd_valid] + EPS)
 
     out["TTC"] = ttc_base
     out["DRAC"] = drac_base
-    out["DRAC_valid_mask"] = drac_mask.astype(int)
+    out["DRAC_valid_mask"] = closing_mask.astype(int)
     out["PSD_base"] = psd_base
-    out["PSD_valid_mask"] = psd_mask.astype(int)
-    out["PSD_allen"] = psd_base
+    out["PSD_valid_mask"] = psd_valid.astype(int)
 
-    for tag in ("L", "R"):
-        gap_tag, lead_v_tag = _compute_gap(tag)
-        ttc_tag, drac_tag, drac_tag_mask, _, _ = _compute_candidate_metrics(
-            gap_tag,
-            vf_aligned,
-            lead_v_tag,
-            vf_abs,
-            mu=mu,
-            grav=grav,
+    for tag, cand in (("L", "leftPrecedingId"), ("R", "rightPrecedingId")):
+        lead_x = pd.to_numeric(out.get(f"{tag}_lead_x"), errors="coerce")
+        lead_x = lead_x if inc else -lead_x
+        lead_len = pd.to_numeric(out.get(f"{tag}_lead_len"), errors="coerce").fillna(0.0)
+        D_center_tag = lead_x - x_dir
+        D_net_tag = D_center_tag - 0.5 * (lead_len + follower_len)
+        D_adj_tag = _shrink_distance(D_net_tag, follower_len, params=params)
+
+        lead_v_tag = pd.to_numeric(out.get(f"{tag}_lead_v"), errors="coerce")
+        lead_v_tag = lead_v_tag if inc else -lead_v_tag
+        dv_tag = vf_aligned - lead_v_tag
+        mask_tag = (D_adj_tag > EPS_DISTANCE) & (dv_tag > EPS_SPEED)
+
+        ttc_tag = _ttc_linear_with_reaction(D_adj_tag, dv_tag, vf_speed, params=params)
+        drac_space = pd.Series(
+            np.maximum((D_adj_tag - vf_speed * float(params.tau_drac)).astype(float), EPS_DISTANCE),
+            index=out.index,
+            dtype=float,
         )
+        drac_tag = pd.Series(np.nan, index=out.index, dtype=float)
+        drac_tag.loc[mask_tag] = (dv_tag.loc[mask_tag] ** 2) / (
+                2.0 * drac_space.loc[mask_tag] + EPS
+        )
+
+        mask_series = pd.Series(0, index=out.index, dtype=int)
+        mask_series.loc[mask_tag] = 1
+
         out[f"TTC_{tag}"] = ttc_tag
         out[f"DRAC_{tag}"] = drac_tag
-        out[f"DRAC_{tag}_valid_mask"] = drac_tag_mask.astype(int)
+        out[f"DRAC_{tag}_valid_mask"] = mask_series
 
     return out
 
 
 def compute_frame_ssm_base(
-    df_lane: pd.DataFrame,
-    mu: float,
-    grav: float,
-    inc: bool,
-    *,
-    params: SSMHyperParams,
+        df_lane: pd.DataFrame,
+        mu: float,
+        grav: float,
 ) -> pd.DataFrame:
-    """Return the base follower-leader metrics without side candidates."""
+    """Compute TTC/DRAC/PSD scaffolding using raw headway information."""
 
-    union_df = compute_frame_ssm_union(df_lane, mu=mu, grav=grav, inc=inc, params=params)
-    drop_cols = [
-        "TTC_L",
-        "TTC_R",
-        "DRAC_L",
-        "DRAC_R",
-        "DRAC_L_valid_mask",
-        "DRAC_R_valid_mask",
-        "L_lead_x",
-        "L_lead_v",
-        "L_lead_len",
-        "R_lead_x",
-        "R_lead_v",
-        "R_lead_len",
-        "L_lead_gap",
-        "R_lead_gap",
-    ]
-    return union_df.drop(columns=[c for c in drop_cols if c in union_df.columns])
+    out = df_lane.copy()
+
+    col_ttc = resolve_col(out, ["ttc"])
+    if col_ttc and col_ttc in out.columns:
+        ttc_raw = pd.to_numeric(out[col_ttc], errors="coerce").where(lambda s: s > 0.0, np.nan)
+    else:
+        ttc_raw = pd.Series(np.nan, index=out.index, dtype=float)
+
+    col_dhw = resolve_col(out, ["dhw", "spaceHeadway", "space_gap"])
+    if col_dhw and col_dhw in out.columns:
+        dhw = pd.to_numeric(out[col_dhw], errors="coerce").where(lambda s: s > 0.0, np.nan)
+    else:
+        dhw = pd.Series(np.nan, index=out.index, dtype=float)
+    out["DHW"] = dhw
+
+    vf = pd.to_numeric(
+        out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
+        errors="coerce",
+    )
+    vl = pd.to_numeric(
+        out.get(
+            "precedingXVelocity_raw",
+            out.get("precedingXVelocity", pd.Series(np.nan, index=out.index)),
+        ),
+        errors="coerce",
+    )
+    dv = vf - vl
+
+    ttc_lin = pd.Series(np.nan, index=out.index, dtype=float)
+    mask_lin = dhw.notna() & (dv > EPS_SPEED)
+    ttc_lin.loc[mask_lin] = dhw.loc[mask_lin] / (dv.loc[mask_lin] + EPS)
+
+    out["TTC"] = pd.concat([ttc_raw, ttc_lin], axis=1).min(axis=1, skipna=True)
+
+    drac_base = pd.Series(np.nan, index=out.index, dtype=float)
+    mask_drac = dhw.notna() & (dv > EPS_SPEED)
+    drac_base.loc[mask_drac] = (dv.loc[mask_drac] ** 2) / (2.0 * dhw.loc[mask_drac] + EPS)
+    out["DRAC"] = drac_base
+    out["DRAC_valid_mask"] = mask_drac.astype(int)
+
+    vf_abs = vf.abs()
+    psd_series = pd.Series(np.nan, index=out.index, dtype=float)
+    mask_psd = dhw.notna() & (vf_abs > EPS_SPEED)
+    denom = (vf_abs ** 2) / (2.0 * float(mu) * float(grav) + EPS)
+    psd_series.loc[mask_psd] = dhw.loc[mask_psd] / (denom.loc[mask_psd] + EPS)
+    out["PSD_allen"] = psd_series.clip(lower=0.0)
+
+    return out
 
 
 def ttc_weight_from_value(
