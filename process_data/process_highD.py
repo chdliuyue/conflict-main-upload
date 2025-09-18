@@ -12,13 +12,17 @@ from pathlib import Path
 from highd_pipeline import (
     DEFAULT_ALPHA,
     DEFAULT_BOUNDARY_M,
+    DEFAULT_DIST_MARGIN_M,
     DEFAULT_GRAV,
     DEFAULT_DRAC_THRESHOLDS,
     DEFAULT_JERK_THR,
+    DEFAULT_LEN_MARGIN_FRAC,
     DEFAULT_MU,
     DEFAULT_NODE_BUCKET_HZ_TARGET,
     DEFAULT_PSD_THRESHOLDS,
     DEFAULT_STRIDE_SEC,
+    DEFAULT_TAU_DRAC,
+    DEFAULT_TAU_TTC,
     DEFAULT_TTC_THRESHOLDS,
     DEFAULT_WINDOW_SEC,
     DEFAULT_WORKERS,
@@ -44,6 +48,30 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--jerk_thr", type=float, default=DEFAULT_JERK_THR, help="jerk threshold for JBR metric")
     ap.add_argument("--mu", type=float, default=DEFAULT_MU, help="friction coefficient for DRAC/PSD")
     ap.add_argument("--grav", type=float, default=DEFAULT_GRAV, help="gravity constant for DRAC/PSD")
+    ap.add_argument(
+        "--ssm_dist_margin",
+        type=float,
+        default=DEFAULT_DIST_MARGIN_M,
+        help="Fixed shrink (m) applied to spacing before TTC/DRAC calculations.",
+    )
+    ap.add_argument(
+        "--ssm_len_margin_frac",
+        type=float,
+        default=DEFAULT_LEN_MARGIN_FRAC,
+        help="Fraction of follower length contributing to the spacing shrink.",
+    )
+    ap.add_argument(
+        "--ssm_tau_ttc",
+        type=float,
+        default=DEFAULT_TAU_TTC,
+        help="Reaction time (s) reserved in TTC spacing adjustments.",
+    )
+    ap.add_argument(
+        "--ssm_tau_drac",
+        type=float,
+        default=DEFAULT_TAU_DRAC,
+        help="Reaction time (s) reserved in DRAC spacing adjustments.",
+    )
     ap.add_argument(
         "--ttc_thr_safe_low",
         type=float,
@@ -131,6 +159,10 @@ def main() -> None:
         jerk_thr=float(args.jerk_thr),
         mu=float(args.mu),
         grav=float(args.grav),
+        dist_margin_m=float(args.ssm_dist_margin),
+        len_margin_frac=float(args.ssm_len_margin_frac),
+        tau_ttc=float(args.ssm_tau_ttc),
+        tau_drac=float(args.ssm_tau_drac),
         ttc_thresholds=(
             float(args.ttc_thr_safe_low),
             float(args.ttc_thr_low_medium),
