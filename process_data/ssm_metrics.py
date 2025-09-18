@@ -177,12 +177,11 @@ def _shrink_distance(
 def _ttc_linear_with_reaction(
     distance: pd.Series,
     dv: pd.Series,
-    v_f: pd.Series,
     follower_speed: pd.Series,
     *,
     params: SSMHyperParams,
 ) -> pd.Series:
-    """Return min(D/dv, max(D - v_f*tau_ttc, EPS)/dv) for dv>0."""
+    """Return min(D/dv, max(D - vf*tau_ttc, EPS)/dv) for dv>0."""
 
     D = pd.to_numeric(distance, errors="coerce")
     closing_speed = pd.to_numeric(dv, errors="coerce")
