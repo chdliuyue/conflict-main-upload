@@ -3,7 +3,7 @@
 """
 Surrogate Safety Measures (TTC / DRAC / PSD)
 — 统一生效条件 + 统一口径 + 节点时间聚合（含 1Hz 合桶）
-— TTC 线性口径 + 反应时间距离修正（min{D/dv, (D - v_f*TAU_TTC)/dv}）
+— TTC 线性口径 + 反应时间距离修正（min{D/dv, (D - v_f*τ_ttc)/dv}）
 — DRAC 含反应时间补偿，PSD 节点同口径
 
 分类规则（基于节点）：
@@ -14,7 +14,8 @@ Surrogate Safety Measures (TTC / DRAC / PSD)
 """
 
 from __future__ import annotations
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -24,6 +25,7 @@ __all__ = [
     "compute_window_base_quantiles", "compute_nodewise_labels",
     "ttc_weight_from_value", "drac_weight_from_value", "psd_weight_from_value",
     "cls_from_avg_weight", "cls4_from_psd",
+    "SSMHyperParams", "DEFAULT_SSM_HYPER_PARAMS",
 ]
 
 # ============================ 常量/旋钮 ============================ #
@@ -40,11 +42,62 @@ LEN_MARGIN_FRAC = 0.20
 TAU_TTC = 0.5  # 仅用于 TTC 的距离修正 D_ttc = max(D - v_f*TAU_TTC, EPS_D) 值越大高类别越多
 TAU_S   = 0.6  # DRAC 的距离修正 D_drac = max(D - v_f*TAU_S, EPS_D) 值越大高类别越多
 
-# PSD 四分类阈
+# 分档阈值
 PSD_THRS = (0.60, 0.80, 1.00)
+TTC_WEIGHT_THRS = (4.0, 3.0, 2.0)
+DRAC_RATIO_THRS = (0.5, 0.75, 0.90)
 
 # 节点合桶目标频率（把 node_hz 的节点先合成约 1 Hz 再做权重平均）
 NODE_BUCKET_HZ_TARGET = 1.0
+
+
+@dataclass(frozen=True)
+class SSMHyperParams:
+    """可调超参数集合，控制 TTC/DRAC/PSD 的一致化逻辑。"""
+
+    dist_margin_m: float = DIST_MARGIN_M
+    len_margin_frac: float = LEN_MARGIN_FRAC
+    tau_ttc: float = TAU_TTC
+    tau_drac: float = TAU_S
+    psd_thresholds: Tuple[float, float, float] = PSD_THRS
+    ttc_weight_thresholds: Tuple[float, float, float] = TTC_WEIGHT_THRS
+    drac_ratio_thresholds: Tuple[float, float, float] = DRAC_RATIO_THRS
+    node_bucket_hz_target: float = NODE_BUCKET_HZ_TARGET
+
+    def __post_init__(self) -> None:
+        t_psd = tuple(self.psd_thresholds)
+        if len(t_psd) != 3 or any(not np.isfinite(x) for x in t_psd):
+            raise ValueError("psd_thresholds must be a finite triple")
+        if not (t_psd[0] <= t_psd[1] <= t_psd[2]):
+            raise ValueError("psd_thresholds must be in ascending order")
+
+        t_ttc = tuple(self.ttc_weight_thresholds)
+        if len(t_ttc) != 3 or any(not np.isfinite(x) for x in t_ttc):
+            raise ValueError("ttc_weight_thresholds must be a finite triple")
+        if not (t_ttc[0] >= t_ttc[1] >= t_ttc[2] > 0):
+            raise ValueError(
+                "ttc_weight_thresholds must be non-increasing and positive"
+            )
+
+        t_drac = tuple(self.drac_ratio_thresholds)
+        if len(t_drac) != 3 or any(not np.isfinite(x) for x in t_drac):
+            raise ValueError("drac_ratio_thresholds must be a finite triple")
+        if not (t_drac[0] <= t_drac[1] <= t_drac[2]):
+            raise ValueError("drac_ratio_thresholds must be in ascending order")
+
+        if self.dist_margin_m < 0:
+            raise ValueError("dist_margin_m must be non-negative")
+        if self.len_margin_frac < 0:
+            raise ValueError("len_margin_frac must be non-negative")
+        if self.tau_ttc < 0:
+            raise ValueError("tau_ttc must be non-negative")
+        if self.tau_drac < 0:
+            raise ValueError("tau_drac must be non-negative")
+        if self.node_bucket_hz_target < 0:
+            raise ValueError("node_bucket_hz_target must be non-negative")
+
+
+DEFAULT_SSM_HYPER_PARAMS = SSMHyperParams()
 
 
 # ============================ 小工具 ============================ #
@@ -173,16 +226,34 @@ def _attach_candidate_info_unique(out: pd.DataFrame,
     out.drop(columns=["leaderId"], inplace=True)
     return out
 
-def _shrink_distance(D: pd.Series, veh_len_f: pd.Series) -> pd.Series:
-    """保守收缩：D_adj = max(D - (DIST_MARGIN_M + LEN_MARGIN_FRAC * L_f), EPS_D)"""
-    adj = DIST_MARGIN_M + LEN_MARGIN_FRAC * pd.to_numeric(veh_len_f, errors="coerce").fillna(0.0)
-    return pd.Series(np.maximum((pd.to_numeric(D, errors="coerce") - adj).astype(float), EPS_D), index=D.index)
+def _shrink_distance(
+    D: pd.Series,
+    veh_len_f: pd.Series,
+    *,
+    params: SSMHyperParams,
+) -> pd.Series:
+    """保守收缩：D_adj = max(D - (dist_margin_m + len_margin_frac * L_f), EPS_D)"""
+    adj = (
+        float(params.dist_margin_m)
+        + float(params.len_margin_frac)
+        * pd.to_numeric(veh_len_f, errors="coerce").fillna(0.0)
+    )
+    return pd.Series(
+        np.maximum((pd.to_numeric(D, errors="coerce") - adj).astype(float), EPS_D),
+        index=D.index,
+    )
 
-def _ttc_linear_with_reaction(D: pd.Series, dv: pd.Series, v_f: pd.Series) -> pd.Series:
+def _ttc_linear_with_reaction(
+    D: pd.Series,
+    dv: pd.Series,
+    v_f: pd.Series,
+    *,
+    params: SSMHyperParams,
+) -> pd.Series:
     """
     线性 TTC 两路并取最小：
       TTC_lin = D / dv
-      TTC_rt  = max(D - v_f*TAU_TTC, EPS_D) / dv
+      TTC_rt  = max(D - v_f*tau_ttc, EPS_D) / dv
     仅对 dv>0 生效。
     """
     TTC_lin = pd.Series(np.nan, index=D.index, dtype=float)
@@ -190,22 +261,29 @@ def _ttc_linear_with_reaction(D: pd.Series, dv: pd.Series, v_f: pd.Series) -> pd
     m = (D > EPS_D) & (dv > EPS_V)
 
     TTC_lin.loc[m] = D[m] / (dv[m] + EPS)
-    D_rt = np.maximum(D - v_f*float(TAU_TTC), EPS_D)
+    D_rt = np.maximum(D - v_f * float(params.tau_ttc), EPS_D)
     TTC_rt.loc[m]  = D_rt[m] / (dv[m] + EPS)
 
     return pd.concat([TTC_lin, TTC_rt], axis=1).min(axis=1, skipna=True)
 
-def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: bool) -> pd.DataFrame:
+def compute_frame_ssm_union(
+    df_lane: pd.DataFrame,
+    mu: float,
+    grav: float,
+    inc: bool,
+    *,
+    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+) -> pd.DataFrame:
     """
     统一“接近”与距离口径，并并入左右候选：
       base：D_eff_base_adj = shrink( min(dhw, D_net_base) )
-            TTC_base = min( D_eff_base_adj/dv_base , (D_eff_base_adj - v_f*TAU_TTC)/dv_base )
-            DRAC_base 用 D_drac_base = max(D_eff_base_adj - v_f*TAU_S, EPS_D)
+            TTC_base = min( D_eff_base_adj/dv_base , (D_eff_base_adj - v_f*tau_ttc)/dv_base )
+            DRAC_base 用 D_drac_base = max(D_eff_base_adj - v_f*tau_drac, EPS_D)
             PSD_base = D_eff_base_adj / (v_f^2/(2μg))
             接近掩码 clos_mask_base = (D_eff_base_adj>0 & Δv_base>0)
       L/R： D_adj_{L/R} = shrink(D_net_{L/R})
-            TTC_{L/R} = min( D_adj_{L/R}/dv_{L/R} , (D_adj_{L/R} - v_f*TAU_TTC)/dv_{L/R} )
-            DRAC_{L/R} 用 D_drac_{L/R} = max(D_adj_{L/R} - v_f*TAU_S, EPS_D)
+            TTC_{L/R} = min( D_adj_{L/R}/dv_{L/R} , (D_adj_{L/R} - v_f*tau_ttc)/dv_{L/R} )
+            DRAC_{L/R} 用 D_drac_{L/R} = max(D_adj_{L/R} - v_f*tau_drac, EPS_D)
     """
     leaders_ref = (df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
                    .drop_duplicates(subset=["frame", "id"]))
@@ -225,7 +303,7 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
     D_center = B_x_dir - out["x_dir"]
     D_net_base = D_center - 0.5 * (out["B_lead_len"] + out["veh_len"])
     D_eff_base = pd.concat([out["DHW"], D_net_base], axis=1).min(axis=1, skipna=True)
-    D_eff_base_adj = _shrink_distance(D_eff_base, out["veh_len"])
+    D_eff_base_adj = _shrink_distance(D_eff_base, out["veh_len"], params=params)
     lead_v_base = pd.to_numeric(
         out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
     )
@@ -234,10 +312,10 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
 
     clos_mask_base = (D_eff_base_adj > EPS_D) & (dv_base > EPS_V)
 
-    TTC_base = _ttc_linear_with_reaction(D_eff_base_adj, dv_base, vf_speed)
+    TTC_base = _ttc_linear_with_reaction(D_eff_base_adj, dv_base, vf_speed, params=params)
 
     D_drac_base = pd.Series(
-        np.maximum(D_eff_base_adj - vf_speed * float(TAU_S), EPS_D),
+        np.maximum(D_eff_base_adj - vf_speed * float(params.tau_drac), EPS_D),
         index=out.index,
         dtype=float,
     )
@@ -264,7 +342,7 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
         lead_x_dir = (out[f"{tag}_lead_x"] if inc else -out[f"{tag}_lead_x"])
         D_center = lead_x_dir - out["x_dir"]
         D_net = D_center - 0.5 * (out[f"{tag}_lead_len"] + out["veh_len"])
-        D_adj = _shrink_distance(D_net, out["veh_len"])
+        D_adj = _shrink_distance(D_net, out["veh_len"], params=params)
         lead_v_tag = pd.to_numeric(
             out.get(f"{tag}_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
         )
@@ -272,12 +350,12 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
         dv_tag = vf_aligned - lead_v_tag_aligned
 
         m = (D_adj > EPS_D) & (dv_tag > EPS_V)
-        TTC_tag = _ttc_linear_with_reaction(D_adj, dv_tag, vf_speed)
+        TTC_tag = _ttc_linear_with_reaction(D_adj, dv_tag, vf_speed, params=params)
         out[f"TTC_{tag}"] = np.nan
         out.loc[m, f"TTC_{tag}"] = TTC_tag[m]
 
         D_drac_tag = pd.Series(
-            np.maximum(D_adj - vf_speed * float(TAU_S), EPS_D),
+            np.maximum(D_adj - vf_speed * float(params.tau_drac), EPS_D),
             index=out.index,
             dtype=float,
         )
@@ -290,45 +368,61 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
 
 
 # ============================ 权重/分类映射 ============================ #
-def ttc_weight_from_value(ttc_val: pd.Series | float) -> pd.Series | float:
-    """TTC>4→0；(3,4]→1；(2,3]→2；(0,2]→3。"""
+def ttc_weight_from_value(
+    ttc_val: pd.Series | float,
+    *,
+    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+) -> pd.Series | float:
+    """TTC>thr0→0；(thr1,thr0]→1；(thr2,thr1]→2；(0,thr2]→3。"""
+    thr0, thr1, thr2 = params.ttc_weight_thresholds
     if np.isscalar(ttc_val):
         t = float(ttc_val) if np.isfinite(ttc_val) else np.nan
         if not np.isfinite(t) or t <= 0: return np.nan
-        if t > 4.0: return 0.0
-        if t > 3.0: return 1.0
-        if t > 2.0: return 2.0
+        if t > thr0: return 0.0
+        if t > thr1: return 1.0
+        if t > thr2: return 2.0
         return 3.0
     t = pd.to_numeric(ttc_val, errors="coerce")
     w = pd.Series(np.nan, index=t.index, dtype=float)
-    w[t > 4.0] = 0.0
-    w[(t > 3.0) & (t <= 4.0)] = 1.0
-    w[(t > 2.0) & (t <= 3.0)] = 2.0
-    w[(t > 0.0) & (t <= 2.0)] = 3.0
+    w[t > thr0] = 0.0
+    w[(t > thr1) & (t <= thr0)] = 1.0
+    w[(t > thr2) & (t <= thr1)] = 2.0
+    w[(t > 0.0) & (t <= thr2)] = 3.0
     return w
 
-def drac_weight_from_value(drac_val: pd.Series | float, mu: float, grav: float) -> pd.Series | float:
-    """r=DRAC/(μg)：r<0.5→0；[0.5,0.75)→1；[0.75,0.90)→2；≥0.90→3。"""
+def drac_weight_from_value(
+    drac_val: pd.Series | float,
+    mu: float,
+    grav: float,
+    *,
+    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+) -> pd.Series | float:
+    """r=DRAC/(μg)：r<thr0→0；[thr0,thr1)→1；[thr1,thr2)→2；≥thr2→3。"""
     amax = float(mu) * float(grav)
+    thr0, thr1, thr2 = params.drac_ratio_thresholds
     if np.isscalar(drac_val):
         d = float(drac_val) if np.isfinite(drac_val) else np.nan
         if not np.isfinite(d) or d <= 0: return np.nan
         r = d / (amax + EPS)
-        if r < 0.5: return 0.0
-        if r < 0.75: return 1.0
-        if r < 0.90: return 2.0
+        if r < thr0: return 0.0
+        if r < thr1: return 1.0
+        if r < thr2: return 2.0
         return 3.0
     r = pd.to_numeric(drac_val, errors="coerce") / (amax + EPS)
     w = pd.Series(np.nan, index=r.index, dtype=float)
-    w[r < 0.5] = 0.0
-    w[(r >= 0.5) & (r < 0.75)] = 1.0
-    w[(r >= 0.75) & (r < 0.90)] = 2.0
-    w[r >= 0.90] = 3.0
+    w[r < thr0] = 0.0
+    w[(r >= thr0) & (r < thr1)] = 1.0
+    w[(r >= thr1) & (r < thr2)] = 2.0
+    w[r >= thr2] = 3.0
     return w
 
-def psd_weight_from_value(psd_val: pd.Series | float) -> pd.Series | float:
-    """PSD<0.60→3；[0.60,0.80)→2；[0.80,1.00)→1；≥1.00→0。"""
-    t1, t2, t3 = PSD_THRS
+def psd_weight_from_value(
+    psd_val: pd.Series | float,
+    *,
+    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
+) -> pd.Series | float:
+    """PSD<thr0→3；[thr0,thr1)→2；[thr1,thr2)→1；≥thr2→0。"""
+    t1, t2, t3 = params.psd_thresholds
     if np.isscalar(psd_val):
         p = float(psd_val) if np.isfinite(psd_val) else np.nan
         if not np.isfinite(p) or p <= 0: return np.nan
@@ -352,10 +446,10 @@ def cls_from_avg_weight(avg_w: float) -> int:
     if 1.0 < avg_w <= 2.0: return 2
     return 3
 
-def cls4_from_psd(psd_p95: float) -> int:
+def cls4_from_psd(psd_p95: float, *, params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS) -> int:
     """仅用于窗口 p95 的四分类（参考）。"""
     if not np.isfinite(psd_p95): return -1
-    t1, t2, t3 = PSD_THRS
+    t1, t2, t3 = params.psd_thresholds
     if psd_p95 < t1: return 3
     elif psd_p95 < t2: return 2
     elif psd_p95 < t3: return 1
@@ -421,18 +515,24 @@ def compute_nodewise_labels(
     drac_q_high: float,  # 未用（保留签名）
     mu: float,
     grav: float,
+    params: SSMHyperParams = DEFAULT_SSM_HYPER_PARAMS,
 ) -> Dict[str, float]:
     """
     统一时间聚合（节点） + 合桶：
       1) 原始节点 index = floor((t - t0)*node_hz)
-      2) bucket_factor = round(node_hz / NODE_BUCKET_HZ_TARGET)；bucket = node // factor
+      2) bucket_factor = round(node_hz / node_bucket_hz_target)；bucket = node // factor
       3) 节点值：TTC→min；DRAC→max（有效并集）；PSD→min（接近掩码）
       4) 权重映射并对“桶节点”求平均
     """
     out: Dict[str, float] = {}
 
     node_idx = np.floor((sub["time"].values - float(t0)) * float(node_hz)).astype("int64")
-    bucket_factor = max(1, int(round(float(node_hz) / float(NODE_BUCKET_HZ_TARGET))))
+    node_hz_val = float(node_hz)
+    bucket_target = float(params.node_bucket_hz_target)
+    if node_hz_val <= 0.0 or bucket_target <= 0.0:
+        bucket_factor = 1
+    else:
+        bucket_factor = max(1, int(round(node_hz_val / bucket_target)))
     bucket_idx = (node_idx // bucket_factor).astype("int64")
 
     default_dt = 1.0 / float(fps) if fps > 0 else (1.0 / float(node_hz) if node_hz > 0 else 0.0)
@@ -524,7 +624,14 @@ def compute_nodewise_labels(
         ],
         axis=1,
     ).min(axis=1, skipna=True)
-    _apply_metric(ttc_frame_min, "min", ttc_weight_from_value, "TTC", quantile_q=0.05, extreme="min")
+    _apply_metric(
+        ttc_frame_min,
+        "min",
+        lambda s: ttc_weight_from_value(s, params=params),
+        "TTC",
+        quantile_q=0.05,
+        extreme="min",
+    )
 
     # ----- DRAC -----
     def _mask(series: pd.Series, col: str) -> pd.Series:
@@ -541,7 +648,7 @@ def compute_nodewise_labels(
     _apply_metric(
         drac_frame_max,
         "max",
-        lambda s: drac_weight_from_value(s, mu=mu, grav=grav),
+        lambda s: drac_weight_from_value(s, mu=mu, grav=grav, params=params),
         "DRAC",
         quantile_q=0.95,
         extreme="max",
@@ -553,7 +660,7 @@ def compute_nodewise_labels(
     _apply_metric(
         psd_series.where(psd_mask, np.nan),
         "min",
-        psd_weight_from_value,
+        lambda s: psd_weight_from_value(s, params=params),
         "PSD",
         quantile_q=0.05,
         extreme="min",
