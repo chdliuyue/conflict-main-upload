@@ -44,15 +44,28 @@ DEFAULT_JERK_THR = 1.5
 DEFAULT_MU = 0.4
 DEFAULT_GRAV = 9.81
 
+# Surrogate safety geometry defaults
+DEFAULT_DIST_MARGIN_M = 1.2
+"""Fixed bumper-to-bumper shrink (metres) applied before TTC/DRAC evaluation."""
+
+DEFAULT_LEN_MARGIN_FRAC = 0.20
+"""Fraction of the follower length folded into the geometric shrink."""
+
+DEFAULT_TAU_TTC = 0.5
+"""Reaction time (s) reserved for TTC by shrinking the effective spacing."""
+
+DEFAULT_TAU_DRAC = 0.6
+"""Reaction time (s) reserved for DRAC by shrinking the effective spacing."""
+
 # Default surrogate safety thresholds
 DEFAULT_TTC_THRESHOLDS: Tuple[float, float, float] = (4.0, 3.0, 2.0)
 """TTC thresholds separating safe/low/medium/high risk in seconds."""
 
-DEFAULT_DRAC_THRESHOLDS: Tuple[float, float, float] = (3.0, 5.0, 8.45)
-"""DRAC thresholds (m/s²) from safe to high risk, reflecting MADR guidance."""
+DEFAULT_DRAC_THRESHOLDS: Tuple[float, float, float] = (4.0, 6.5, 8.45)
+"""DRAC thresholds (m/s²) tuned from comfort to severe braking (8.45 m/s² high risk)."""
 
-DEFAULT_PSD_THRESHOLDS: Tuple[float, float, float] = (1.0, 0.5, 0.0)
-"""PSD thresholds (dimensionless) for safe/low/medium/high risk classes."""
+DEFAULT_PSD_THRESHOLDS: Tuple[float, float, float] = (1.0, 0.85, 0.70)
+"""PSD thresholds (dimensionless) dividing safe (>1.0) through critical (<0.70) gaps."""
 
 DEFAULT_NODE_BUCKET_HZ_TARGET = 1.0
 """Target frequency (Hz) when collapsing node-level conflict exposure buckets."""
@@ -84,6 +97,10 @@ class HighDPipelineConfig:
     jerk_thr: float = DEFAULT_JERK_THR
     mu: float = DEFAULT_MU
     grav: float = DEFAULT_GRAV
+    dist_margin_m: float = DEFAULT_DIST_MARGIN_M
+    len_margin_frac: float = DEFAULT_LEN_MARGIN_FRAC
+    tau_ttc: float = DEFAULT_TAU_TTC
+    tau_drac: float = DEFAULT_TAU_DRAC
     ttc_thresholds: Tuple[float, float, float] = DEFAULT_TTC_THRESHOLDS
     drac_thresholds: Tuple[float, float, float] = DEFAULT_DRAC_THRESHOLDS
     psd_thresholds: Tuple[float, float, float] = DEFAULT_PSD_THRESHOLDS
@@ -107,6 +124,10 @@ class HighDPipelineConfig:
 
     def build_ssm_params(self) -> SSMHyperParams:
         return SSMHyperParams(
+            dist_margin_m=self.dist_margin_m,
+            len_margin_frac=self.len_margin_frac,
+            tau_ttc=self.tau_ttc,
+            tau_drac=self.tau_drac,
             ttc_thresholds=self.ttc_thresholds,
             drac_thresholds=self.drac_thresholds,
             psd_thresholds=self.psd_thresholds,
@@ -527,6 +548,10 @@ def process_one_recording(
         rq_den_min=RQ_DEN_MIN,
         k_edie_min_veh_time_s=K_EDIE_MIN_VEH_TIME_S,
         k_edie_density_floor=K_EDIE_DENSITY_FLOOR,
+        dist_margin_m=ssm_params.dist_margin_m,
+        len_margin_frac=ssm_params.len_margin_frac,
+        tau_ttc=ssm_params.tau_ttc,
+        tau_drac=ssm_params.tau_drac,
         ttc_thresholds=ssm_params.ttc_thresholds,
         drac_thresholds=ssm_params.drac_thresholds,
         psd_thresholds=ssm_params.psd_thresholds,
@@ -738,4 +763,3 @@ __all__ = [
     "DEFAULT_PSD_THRESHOLDS",
     "DEFAULT_NODE_BUCKET_HZ_TARGET",
 ]
-
