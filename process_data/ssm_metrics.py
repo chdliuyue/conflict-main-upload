@@ -213,8 +213,11 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
     out = compute_frame_ssm_base(df_lane, mu=mu, grav=grav).reset_index(drop=True)
     out["x_dir"] = out["x"] if inc else -out["x"]
 
-    vf = out.get("xVelocity_raw").astype(float)
-    vf_abs = vf.abs()
+    vf_raw = pd.to_numeric(
+        out.get("xVelocity_raw", pd.Series(np.nan, index=out.index)), errors="coerce"
+    )
+    vf_aligned = vf_raw if inc else -vf_raw
+    vf_speed = vf_aligned.clip(lower=0.0)
 
     # base
     out = _attach_candidate_info_unique(out, leaders_ref, "precedingId", "B")
@@ -223,20 +226,30 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
     D_net_base = D_center - 0.5 * (out["B_lead_len"] + out["veh_len"])
     D_eff_base = pd.concat([out["DHW"], D_net_base], axis=1).min(axis=1, skipna=True)
     D_eff_base_adj = _shrink_distance(D_eff_base, out["veh_len"])
-    dv_base = vf - out["B_lead_v"]
+    lead_v_base = pd.to_numeric(
+        out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
+    )
+    lead_v_aligned = lead_v_base if inc else -lead_v_base
+    dv_base = vf_aligned - lead_v_aligned
 
     clos_mask_base = (D_eff_base_adj > EPS_D) & (dv_base > EPS_V)
 
-    TTC_base = _ttc_linear_with_reaction(D_eff_base_adj, dv_base, vf)
+    TTC_base = _ttc_linear_with_reaction(D_eff_base_adj, dv_base, vf_speed)
 
-    D_drac_base = np.maximum(D_eff_base_adj - vf * float(TAU_S), EPS_D)
+    D_drac_base = pd.Series(
+        np.maximum(D_eff_base_adj - vf_speed * float(TAU_S), EPS_D),
+        index=out.index,
+        dtype=float,
+    )
     DRAC_base = pd.Series(np.nan, index=out.index, dtype=float)
-    DRAC_base.loc[clos_mask_base] = (dv_base[clos_mask_base] ** 2) / (2.0 * D_drac_base[clos_mask_base] + EPS)
+    DRAC_base.loc[clos_mask_base] = (dv_base[clos_mask_base] ** 2) / (
+        2.0 * D_drac_base[clos_mask_base] + EPS
+    )
 
-    lead_v_abs = pd.to_numeric(out.get("B_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce").abs()
+    lead_speed = lead_v_aligned.clip(lower=0.0)
     PSD_base = pd.Series(np.nan, index=out.index, dtype=float)
-    psd_denom = (vf_abs ** 2 - lead_v_abs ** 2) / (2.0 * mu * grav + EPS)
-    psd_valid = clos_mask_base & (vf_abs > 0.0) & (psd_denom > 0.0)
+    psd_denom = (vf_speed ** 2 - lead_speed ** 2) / (2.0 * mu * grav + EPS)
+    psd_valid = clos_mask_base & (vf_speed > EPS_V) & (psd_denom > 0.0)
     PSD_base.loc[psd_valid] = D_eff_base_adj[psd_valid] / (psd_denom[psd_valid] + EPS)
 
     out["TTC"] = TTC_base
@@ -252,14 +265,22 @@ def compute_frame_ssm_union(df_lane: pd.DataFrame, mu: float, grav: float, inc: 
         D_center = lead_x_dir - out["x_dir"]
         D_net = D_center - 0.5 * (out[f"{tag}_lead_len"] + out["veh_len"])
         D_adj = _shrink_distance(D_net, out["veh_len"])
-        dv_tag = vf - out[f"{tag}_lead_v"]
+        lead_v_tag = pd.to_numeric(
+            out.get(f"{tag}_lead_v", pd.Series(np.nan, index=out.index)), errors="coerce"
+        )
+        lead_v_tag_aligned = lead_v_tag if inc else -lead_v_tag
+        dv_tag = vf_aligned - lead_v_tag_aligned
 
         m = (D_adj > EPS_D) & (dv_tag > EPS_V)
-        TTC_tag = _ttc_linear_with_reaction(D_adj, dv_tag, vf)
+        TTC_tag = _ttc_linear_with_reaction(D_adj, dv_tag, vf_speed)
         out[f"TTC_{tag}"] = np.nan
         out.loc[m, f"TTC_{tag}"] = TTC_tag[m]
 
-        D_drac_tag = np.maximum(D_adj - vf * float(TAU_S), EPS_D)
+        D_drac_tag = pd.Series(
+            np.maximum(D_adj - vf_speed * float(TAU_S), EPS_D),
+            index=out.index,
+            dtype=float,
+        )
         out[f"DRAC_{tag}"] = np.nan
         out[f"DRAC_{tag}_valid_mask"] = 0
         out.loc[m, f"DRAC_{tag}"] = ((dv_tag ** 2) / (2.0 * D_drac_tag + EPS))[m]
