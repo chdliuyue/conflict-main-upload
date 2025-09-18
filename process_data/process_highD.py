@@ -12,10 +12,18 @@ from pathlib import Path
 from highd_pipeline import (
     DEFAULT_ALPHA,
     DEFAULT_BOUNDARY_M,
+    DEFAULT_DIST_MARGIN_M,
     DEFAULT_GRAV,
+    DEFAULT_DRAC_THRESHOLDS,
     DEFAULT_JERK_THR,
+    DEFAULT_LEN_MARGIN_FRAC,
     DEFAULT_MU,
+    DEFAULT_NODE_BUCKET_HZ_TARGET,
+    DEFAULT_PSD_THRESHOLDS,
     DEFAULT_STRIDE_SEC,
+    DEFAULT_TAU_DRAC,
+    DEFAULT_TAU_TTC,
+    DEFAULT_TTC_THRESHOLDS,
     DEFAULT_WINDOW_SEC,
     DEFAULT_WORKERS,
     HighDPipelineConfig,
@@ -40,6 +48,90 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--jerk_thr", type=float, default=DEFAULT_JERK_THR, help="jerk threshold for JBR metric")
     ap.add_argument("--mu", type=float, default=DEFAULT_MU, help="friction coefficient for DRAC/PSD")
     ap.add_argument("--grav", type=float, default=DEFAULT_GRAV, help="gravity constant for DRAC/PSD")
+    ap.add_argument(
+        "--ssm_dist_margin",
+        type=float,
+        default=DEFAULT_DIST_MARGIN_M,
+        help="Fixed shrink (m) applied to spacing before TTC/DRAC calculations.",
+    )
+    ap.add_argument(
+        "--ssm_len_margin_frac",
+        type=float,
+        default=DEFAULT_LEN_MARGIN_FRAC,
+        help="Fraction of follower length contributing to the spacing shrink.",
+    )
+    ap.add_argument(
+        "--ssm_tau_ttc",
+        type=float,
+        default=DEFAULT_TAU_TTC,
+        help="Reaction time (s) reserved in TTC spacing adjustments.",
+    )
+    ap.add_argument(
+        "--ssm_tau_drac",
+        type=float,
+        default=DEFAULT_TAU_DRAC,
+        help="Reaction time (s) reserved in DRAC spacing adjustments.",
+    )
+    ap.add_argument(
+        "--ttc_thr_safe_low",
+        type=float,
+        default=DEFAULT_TTC_THRESHOLDS[0],
+        help="TTC threshold (s) separating safe (class 0) and low-risk (class 1).",
+    )
+    ap.add_argument(
+        "--ttc_thr_low_medium",
+        type=float,
+        default=DEFAULT_TTC_THRESHOLDS[1],
+        help="TTC threshold (s) separating low-risk (class 1) and medium-risk (class 2).",
+    )
+    ap.add_argument(
+        "--ttc_thr_medium_high",
+        type=float,
+        default=DEFAULT_TTC_THRESHOLDS[2],
+        help="TTC threshold (s) separating medium-risk (class 2) and high-risk (class 3).",
+    )
+    ap.add_argument(
+        "--drac_thr_safe_low",
+        type=float,
+        default=DEFAULT_DRAC_THRESHOLDS[0],
+        help="DRAC threshold (m/s^2) between safe (class 0) and low-risk (class 1).",
+    )
+    ap.add_argument(
+        "--drac_thr_low_medium",
+        type=float,
+        default=DEFAULT_DRAC_THRESHOLDS[1],
+        help="DRAC threshold (m/s^2) between low-risk (class 1) and medium-risk (class 2).",
+    )
+    ap.add_argument(
+        "--drac_thr_medium_high",
+        type=float,
+        default=DEFAULT_DRAC_THRESHOLDS[2],
+        help="DRAC threshold (m/s^2) for medium-risk (class 2) versus high-risk (class 3).",
+    )
+    ap.add_argument(
+        "--psd_thr_safe_low",
+        type=float,
+        default=DEFAULT_PSD_THRESHOLDS[0],
+        help="PSD threshold separating safe (class 0) and low-risk (class 1).",
+    )
+    ap.add_argument(
+        "--psd_thr_low_medium",
+        type=float,
+        default=DEFAULT_PSD_THRESHOLDS[1],
+        help="PSD threshold separating low-risk (class 1) and medium-risk (class 2).",
+    )
+    ap.add_argument(
+        "--psd_thr_medium_high",
+        type=float,
+        default=DEFAULT_PSD_THRESHOLDS[2],
+        help="PSD threshold separating medium-risk (class 2) and high-risk (class 3).",
+    )
+    ap.add_argument(
+        "--node_bucket_hz",
+        type=float,
+        default=DEFAULT_NODE_BUCKET_HZ_TARGET,
+        help="Target Hz for node aggregation when averaging SSM exposure buckets.",
+    )
     ap.add_argument("--accel_clip", type=float, default=None, help="optional acceleration clipping value")
     ap.add_argument("--keep_empty", action="store_true", help="keep empty windows without events")
     ap.add_argument("--workers", type=int, default=None, help="number of workers (defaults to half CPUs)")
@@ -67,6 +159,26 @@ def main() -> None:
         jerk_thr=float(args.jerk_thr),
         mu=float(args.mu),
         grav=float(args.grav),
+        dist_margin_m=float(args.ssm_dist_margin),
+        len_margin_frac=float(args.ssm_len_margin_frac),
+        tau_ttc=float(args.ssm_tau_ttc),
+        tau_drac=float(args.ssm_tau_drac),
+        ttc_thresholds=(
+            float(args.ttc_thr_safe_low),
+            float(args.ttc_thr_low_medium),
+            float(args.ttc_thr_medium_high),
+        ),
+        drac_thresholds=(
+            float(args.drac_thr_safe_low),
+            float(args.drac_thr_low_medium),
+            float(args.drac_thr_medium_high),
+        ),
+        psd_thresholds=(
+            float(args.psd_thr_safe_low),
+            float(args.psd_thr_low_medium),
+            float(args.psd_thr_medium_high),
+        ),
+        node_bucket_hz_target=float(args.node_bucket_hz),
         accel_clip=(float(args.accel_clip) if args.accel_clip is not None else None),
         keep_empty=bool(args.keep_empty),
         workers=int(args.workers) if args.workers is not None else DEFAULT_WORKERS,

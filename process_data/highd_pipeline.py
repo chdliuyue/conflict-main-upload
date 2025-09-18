@@ -27,6 +27,7 @@ from proc_utils import (
     smooth_series,
 )
 from summarize_windows import summarize_windows_df
+from ssm_metrics import SSMHyperParams
 
 try:  # pragma: no cover - tqdm is optional
     from tqdm import tqdm
@@ -42,6 +43,32 @@ DEFAULT_BOUNDARY_M = 15.0
 DEFAULT_JERK_THR = 1.5
 DEFAULT_MU = 0.4
 DEFAULT_GRAV = 9.81
+
+# Surrogate safety geometry defaults
+DEFAULT_DIST_MARGIN_M = 1.2
+"""Fixed bumper-to-bumper shrink (metres) applied before TTC/DRAC evaluation."""
+
+DEFAULT_LEN_MARGIN_FRAC = 0.20
+"""Fraction of the follower length folded into the geometric shrink."""
+
+DEFAULT_TAU_TTC = 0.5
+"""Reaction time (s) reserved for TTC by shrinking the effective spacing."""
+
+DEFAULT_TAU_DRAC = 0.6
+"""Reaction time (s) reserved for DRAC by shrinking the effective spacing."""
+
+# Default surrogate safety thresholds
+DEFAULT_TTC_THRESHOLDS: Tuple[float, float, float] = (4.0, 3.0, 2.0)
+"""TTC thresholds separating safe/low/medium/high risk in seconds."""
+
+DEFAULT_DRAC_THRESHOLDS: Tuple[float, float, float] = (4.0, 6.5, 8.45)
+"""DRAC thresholds (m/s²) tuned from comfort to severe braking (8.45 m/s² high risk)."""
+
+DEFAULT_PSD_THRESHOLDS: Tuple[float, float, float] = (1.0, 0.85, 0.70)
+"""PSD thresholds (dimensionless) dividing safe (>1.0) through critical (<0.70) gaps."""
+
+DEFAULT_NODE_BUCKET_HZ_TARGET = 1.0
+"""Target frequency (Hz) when collapsing node-level conflict exposure buckets."""
 
 SPEED_FLOOR = 0.3
 MIN_VALID_FRAMES = 10
@@ -70,6 +97,14 @@ class HighDPipelineConfig:
     jerk_thr: float = DEFAULT_JERK_THR
     mu: float = DEFAULT_MU
     grav: float = DEFAULT_GRAV
+    dist_margin_m: float = DEFAULT_DIST_MARGIN_M
+    len_margin_frac: float = DEFAULT_LEN_MARGIN_FRAC
+    tau_ttc: float = DEFAULT_TAU_TTC
+    tau_drac: float = DEFAULT_TAU_DRAC
+    ttc_thresholds: Tuple[float, float, float] = DEFAULT_TTC_THRESHOLDS
+    drac_thresholds: Tuple[float, float, float] = DEFAULT_DRAC_THRESHOLDS
+    psd_thresholds: Tuple[float, float, float] = DEFAULT_PSD_THRESHOLDS
+    node_bucket_hz_target: float = DEFAULT_NODE_BUCKET_HZ_TARGET
     accel_clip: Optional[float] = None
     keep_empty: bool = False
     workers: int = DEFAULT_WORKERS
@@ -86,6 +121,18 @@ class HighDPipelineConfig:
             return self.clean_output
         name = f"all_windows_{int(self.window_sec)}s_clean.csv"
         return self.out / name
+
+    def build_ssm_params(self) -> SSMHyperParams:
+        return SSMHyperParams(
+            dist_margin_m=self.dist_margin_m,
+            len_margin_frac=self.len_margin_frac,
+            tau_ttc=self.tau_ttc,
+            tau_drac=self.tau_drac,
+            ttc_thresholds=self.ttc_thresholds,
+            drac_thresholds=self.drac_thresholds,
+            psd_thresholds=self.psd_thresholds,
+            node_bucket_hz_target=self.node_bucket_hz_target,
+        )
 
 
 @dataclass
@@ -112,6 +159,7 @@ def aggregate_window_lane(
     grav: float,
     inc: bool,
     keep_empty: bool,
+    ssm_params: SSMHyperParams,
 ) -> Dict[str, float]:
     t1 = t0 + W
     evU = evU_all[(evU_all["time"] >= t0) & (evU_all["time"] < t1)]
@@ -234,6 +282,7 @@ def aggregate_window_lane(
         drac_q_high=DRAC_Q_HIGH,
         mu=mu,
         grav=grav,
+        params=ssm_params,
     )
 
     # PSD 掩码与四分类
@@ -312,6 +361,7 @@ def process_one_recording(
     jerk_thr: float,
     mu: float,
     grav: float,
+    ssm_params: SSMHyperParams,
     accel_clip: Optional[float],
     keep_empty: bool,
     loc_anchors: Dict[int, Tuple[float, float]],
@@ -425,7 +475,13 @@ def process_one_recording(
 
         X_up, X_down = (XU_loc, XD_loc) if inc else (XD_loc, XU_loc)
 
-        df_lane_ssm = compute_frame_ssm_union(df_lane, mu=mu, grav=grav, inc=inc)
+        df_lane_ssm = compute_frame_ssm_union(
+            df_lane,
+            mu=mu,
+            grav=grav,
+            inc=inc,
+            params=ssm_params,
+        )
 
         evU_all = crossing_events_full(df_lane_ssm, X_up, inc)
         evD_all = crossing_events_full(df_lane_ssm, X_down, inc)
@@ -449,6 +505,7 @@ def process_one_recording(
                 grav=grav,
                 inc=inc,
                 keep_empty=keep_empty,
+                ssm_params=ssm_params,
             )
             if not row:
                 continue
@@ -491,6 +548,14 @@ def process_one_recording(
         rq_den_min=RQ_DEN_MIN,
         k_edie_min_veh_time_s=K_EDIE_MIN_VEH_TIME_S,
         k_edie_density_floor=K_EDIE_DENSITY_FLOOR,
+        dist_margin_m=ssm_params.dist_margin_m,
+        len_margin_frac=ssm_params.len_margin_frac,
+        tau_ttc=ssm_params.tau_ttc,
+        tau_drac=ssm_params.tau_drac,
+        ttc_thresholds=ssm_params.ttc_thresholds,
+        drac_thresholds=ssm_params.drac_thresholds,
+        psd_thresholds=ssm_params.psd_thresholds,
+        node_bucket_hz_target=ssm_params.node_bucket_hz_target,
         keep_empty=keep_empty,
         candidate_union="base + leftPreceding + rightPreceding",
         labels_policy=(
@@ -592,6 +657,8 @@ def run_highd_pipeline(config: HighDPipelineConfig) -> PipelineResult:
         loc_anchors = precompute_location_anchors(rec_dirs)
         print(f"[INFO] Location anchors prepared for {len(loc_anchors)} locations")
 
+    ssm_params = config.build_ssm_params()
+
     job_args_list = [
         (
             d,
@@ -603,6 +670,7 @@ def run_highd_pipeline(config: HighDPipelineConfig) -> PipelineResult:
             config.jerk_thr,
             config.mu,
             config.grav,
+            ssm_params,
             config.accel_clip,
             config.keep_empty,
             loc_anchors,
@@ -690,5 +758,9 @@ __all__ = [
     "DEFAULT_JERK_THR",
     "DEFAULT_MU",
     "DEFAULT_GRAV",
+    "DEFAULT_TTC_THRESHOLDS",
+    "DEFAULT_DRAC_THRESHOLDS",
+    "DEFAULT_PSD_THRESHOLDS",
+    "DEFAULT_NODE_BUCKET_HZ_TARGET",
 ]
 
