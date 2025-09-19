@@ -220,6 +220,14 @@ def compute_frame_ssm_union(
 
     out = df_lane.copy().reset_index(drop=True)
 
+    dhw_col = resolve_col(out, ["DHW", "dhw", "spaceHeadway", "space_gap"])
+    if dhw_col is not None and dhw_col in out.columns:
+        dhw_series = pd.to_numeric(out[dhw_col], errors="coerce")
+        dhw_series = dhw_series.where(dhw_series > 0.0, np.nan)
+    else:
+        dhw_series = pd.Series(np.nan, index=out.index, dtype=float)
+    out["DHW"] = dhw_series
+
     leaders_ref = (
         df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
         .drop_duplicates(subset=["frame", "id"])
@@ -235,7 +243,7 @@ def compute_frame_ssm_union(
 
     vf_raw = pd.to_numeric(
         out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
-    errors = "coerce",
+        errors="coerce",
     )
     vf_aligned = vf_raw if inc else -vf_raw
     vf_speed = vf_aligned.clip(lower=0.0)
@@ -243,11 +251,12 @@ def compute_frame_ssm_union(
     base_lead_x = pd.to_numeric(out.get("B_lead_x"), errors="coerce")
     base_lead_x = base_lead_x if inc else -base_lead_x
     base_lead_len = pd.to_numeric(out.get("B_lead_len"), errors="coerce").fillna(0.0)
+    dhw_series = out.get("DHW", pd.Series(np.nan, index=out.index, dtype=float))
     D_center = base_lead_x - x_dir
-    D_net = D_center - 0.5 * (base_lead_len + follower_len)
-    D_eff = pd.concat([out.get("DHW", pd.Series(dtype=float)), D_net], axis=1).min(
-        axis=1, skipna=True
-    )
+    D_net = pd.to_numeric(D_center - 0.5 * (base_lead_len + follower_len), errors="coerce")
+    D_net = D_net.where(D_net > 0.0, np.nan)
+    D_eff = dhw_series.combine_first(D_net)
+    D_eff = pd.to_numeric(D_eff, errors="coerce").where(lambda s: s > 0.0, np.nan)
     D_adj = _shrink_distance(D_eff, follower_len, params=params)
 
     lead_v_base = pd.to_numeric(out.get("B_lead_v"), errors="coerce")
@@ -547,11 +556,18 @@ def compute_window_base_quantiles(
         a_frames = drac_max_frame.replace([np.inf, -np.inf], np.nan).dropna()
         out["DRAC_p95"] = percentile(a_frames, 95.0) if len(a_frames) >= min_valid_frames else np.nan
 
-    psd_series = (
-        sub.get("PSD_allen", pd.Series(dtype=float))
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
+    psd_col = resolve_col(sub, ["PSD_base", "PSD_allen"])
+    if psd_col is not None and psd_col in sub.columns:
+        psd_values = pd.to_numeric(sub[psd_col], errors="coerce")
+    else:
+        psd_values = pd.Series(np.nan, index=sub.index, dtype=float)
+
+    psd_mask_col = resolve_col(sub, ["PSD_valid_mask"])
+    if psd_mask_col is not None and psd_mask_col in sub.columns:
+        mask_series = pd.to_numeric(sub[psd_mask_col], errors="coerce").fillna(0)
+        psd_values = psd_values.where(mask_series.astype(int) == 1, np.nan)
+
+    psd_series = psd_values.replace([np.inf, -np.inf], np.nan).dropna()
     out["PSD_p95"] = percentile(psd_series, 95.0) if len(psd_series) else np.nan
     return out
 
