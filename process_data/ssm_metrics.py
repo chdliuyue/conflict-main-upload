@@ -251,11 +251,12 @@ def compute_frame_ssm_union(
     base_lead_x = pd.to_numeric(out.get("B_lead_x"), errors="coerce")
     base_lead_x = base_lead_x if inc else -base_lead_x
     base_lead_len = pd.to_numeric(out.get("B_lead_len"), errors="coerce").fillna(0.0)
+    dhw_series = out.get("DHW", pd.Series(np.nan, index=out.index, dtype=float))
     D_center = base_lead_x - x_dir
-    D_net = D_center - 0.5 * (base_lead_len + follower_len)
-    D_eff = pd.concat([out.get("DHW", pd.Series(dtype=float)), D_net], axis=1).min(
-        axis=1, skipna=True
-    )
+    D_net = pd.to_numeric(D_center - 0.5 * (base_lead_len + follower_len), errors="coerce")
+    D_net = D_net.where(D_net > 0.0, np.nan)
+    D_eff = dhw_series.combine_first(D_net)
+    D_eff = pd.to_numeric(D_eff, errors="coerce").where(lambda s: s > 0.0, np.nan)
     D_adj = _shrink_distance(D_eff, follower_len, params=params)
 
     lead_v_base = pd.to_numeric(out.get("B_lead_v"), errors="coerce")
