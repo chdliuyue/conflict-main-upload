@@ -61,6 +61,7 @@ SUMMARY_EXTRA_COLUMNS: Tuple[str, ...] = (
     "TTC_weight_avg",
     "DRAC_weight_avg",
     "PSD_weight_avg",
+    "PSD_weight_avg_time",
     "TTC_exp_s1",
     "TTC_exp_s2",
     "TTC_exp_s3",
@@ -128,4 +129,3 @@ __all__ = [
     "ALLOWED_LABEL_VALUES",
     "available_columns",
 ]
-
