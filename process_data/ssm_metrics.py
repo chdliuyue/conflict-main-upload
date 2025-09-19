@@ -220,6 +220,14 @@ def compute_frame_ssm_union(
 
     out = df_lane.copy().reset_index(drop=True)
 
+    dhw_col = resolve_col(out, ["DHW", "dhw", "spaceHeadway", "space_gap"])
+    if dhw_col is not None and dhw_col in out.columns:
+        dhw_series = pd.to_numeric(out[dhw_col], errors="coerce")
+        dhw_series = dhw_series.where(dhw_series > 0.0, np.nan)
+    else:
+        dhw_series = pd.Series(np.nan, index=out.index, dtype=float)
+    out["DHW"] = dhw_series
+
     leaders_ref = (
         df_lane[["frame", "id", "x", "xVelocity_raw", "veh_len"]]
         .drop_duplicates(subset=["frame", "id"])
@@ -235,7 +243,7 @@ def compute_frame_ssm_union(
 
     vf_raw = pd.to_numeric(
         out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
-    errors = "coerce",
+        errors="coerce",
     )
     vf_aligned = vf_raw if inc else -vf_raw
     vf_speed = vf_aligned.clip(lower=0.0)
@@ -547,11 +555,18 @@ def compute_window_base_quantiles(
         a_frames = drac_max_frame.replace([np.inf, -np.inf], np.nan).dropna()
         out["DRAC_p95"] = percentile(a_frames, 95.0) if len(a_frames) >= min_valid_frames else np.nan
 
-    psd_series = (
-        sub.get("PSD_allen", pd.Series(dtype=float))
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
+    psd_col = resolve_col(sub, ["PSD_base", "PSD_allen"])
+    if psd_col is not None and psd_col in sub.columns:
+        psd_values = pd.to_numeric(sub[psd_col], errors="coerce")
+    else:
+        psd_values = pd.Series(np.nan, index=sub.index, dtype=float)
+
+    psd_mask_col = resolve_col(sub, ["PSD_valid_mask"])
+    if psd_mask_col is not None and psd_mask_col in sub.columns:
+        mask_series = pd.to_numeric(sub[psd_mask_col], errors="coerce").fillna(0)
+        psd_values = psd_values.where(mask_series.astype(int) == 1, np.nan)
+
+    psd_series = psd_values.replace([np.inf, -np.inf], np.nan).dropna()
     out["PSD_p95"] = percentile(psd_series, 95.0) if len(psd_series) else np.nan
     return out
 
