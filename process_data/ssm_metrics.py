@@ -243,7 +243,7 @@ def compute_frame_ssm_union(
 
     vf_raw = pd.to_numeric(
         out.get("xVelocity_raw", out.get("xVelocity", pd.Series(np.nan, index=out.index))),
-        errors="coerce",
+        errors = "coerce",
     )
     vf_aligned = vf_raw if inc else -vf_raw
     vf_speed = vf_aligned.clip(lower=0.0)
@@ -255,15 +255,15 @@ def compute_frame_ssm_union(
     D_center = base_lead_x - x_dir
     D_net = pd.to_numeric(D_center - 0.5 * (base_lead_len + follower_len), errors="coerce")
     D_net = D_net.where(D_net > 0.0, np.nan)
-    D_eff = dhw_series.combine_first(D_net)
-    D_eff = pd.to_numeric(D_eff, errors="coerce").where(lambda s: s > 0.0, np.nan)
+    D_eff = pd.to_numeric(dhw_series.combine_first(D_net), errors="coerce")
+    D_eff = D_eff.where(D_eff > 0.0, np.nan)
     D_adj = _shrink_distance(D_eff, follower_len, params=params)
 
     lead_v_base = pd.to_numeric(out.get("B_lead_v"), errors="coerce")
     lead_v_aligned = lead_v_base if inc else -lead_v_base
     dv_base = vf_aligned - lead_v_aligned
 
-    closing_mask = (D_adj > EPS_DISTANCE) & (dv_base > EPS_SPEED)
+    closing_mask = (D_eff > EPS_DISTANCE) & (dv_base > EPS_SPEED)
 
     ttc_base = _ttc_linear_with_reaction(D_adj, dv_base, vf_speed, params=params)
 
@@ -294,13 +294,14 @@ def compute_frame_ssm_union(
         lead_x = lead_x if inc else -lead_x
         lead_len = pd.to_numeric(out.get(f"{tag}_lead_len"), errors="coerce").fillna(0.0)
         D_center_tag = lead_x - x_dir
-        D_net_tag = D_center_tag - 0.5 * (lead_len + follower_len)
+        D_net_tag = pd.to_numeric(D_center_tag - 0.5 * (lead_len + follower_len), errors="coerce")
+        D_net_tag = D_net_tag.where(D_net_tag > 0.0, np.nan)
         D_adj_tag = _shrink_distance(D_net_tag, follower_len, params=params)
 
         lead_v_tag = pd.to_numeric(out.get(f"{tag}_lead_v"), errors="coerce")
         lead_v_tag = lead_v_tag if inc else -lead_v_tag
         dv_tag = vf_aligned - lead_v_tag
-        mask_tag = (D_adj_tag > EPS_DISTANCE) & (dv_tag > EPS_SPEED)
+        mask_tag = (D_net_tag > EPS_DISTANCE) & (dv_tag > EPS_SPEED)
 
         ttc_tag = _ttc_linear_with_reaction(D_adj_tag, dv_tag, vf_speed, params=params)
         drac_space = pd.Series(
