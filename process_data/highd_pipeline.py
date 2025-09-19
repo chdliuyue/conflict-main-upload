@@ -45,27 +45,27 @@ DEFAULT_MU = 0.4
 DEFAULT_GRAV = 9.81
 
 # Surrogate safety geometry defaults
-DEFAULT_DIST_MARGIN_M = 1.2
+DEFAULT_DIST_MARGIN_M = 1.0
 """Fixed bumper-to-bumper shrink (metres) applied before TTC/DRAC evaluation."""
 
 DEFAULT_LEN_MARGIN_FRAC = 0.20
 """Fraction of the follower length folded into the geometric shrink."""
 
-DEFAULT_TAU_TTC = 0.5
+DEFAULT_TAU_TTC = 0.4
 """Reaction time (s) reserved for TTC by shrinking the effective spacing."""
 
-DEFAULT_TAU_DRAC = 0.6
+DEFAULT_TAU_DRAC = 0.5
 """Reaction time (s) reserved for DRAC by shrinking the effective spacing."""
 
 # Default surrogate safety thresholds
 DEFAULT_TTC_THRESHOLDS: Tuple[float, float, float] = (4.0, 3.0, 2.0)
 """TTC thresholds separating safe/low/medium/high risk in seconds."""
 
-DEFAULT_DRAC_THRESHOLDS: Tuple[float, float, float] = (4.0, 6.5, 8.45)
+DEFAULT_DRAC_THRESHOLDS: Tuple[float, float, float] = (3.4, 6.7, 8.45)
 """DRAC thresholds (m/s²) tuned from comfort to severe braking (8.45 m/s² high risk)."""
 
-DEFAULT_PSD_THRESHOLDS: Tuple[float, float, float] = (1.0, 0.85, 0.70)
-"""PSD thresholds (dimensionless) dividing safe (>1.0) through critical (<0.70) gaps."""
+DEFAULT_PSD_THRESHOLDS: Tuple[float, float, float] = (1.5, 1.2, 1.00)
+"""PSD thresholds (dimensionless) dividing safe (>1.0) through critical (<1.00) gaps."""
 
 DEFAULT_NODE_BUCKET_HZ_TARGET = 1.0
 """Target frequency (Hz) when collapsing node-level conflict exposure buckets."""
